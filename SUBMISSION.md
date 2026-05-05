@@ -150,19 +150,27 @@ python eval_project_b.py \
 
 ## 8. Compliance status — `iter1` (Project A)
 
+Architecture as of this iteration: **MobileNetV3-Small backbone + soft
+K-cluster classifier head** (K = 16). The backbone outputs 16 logits;
+softmax over them is multiplied by hard-coded cluster centers (stored
+as a `(16, 2)` buffer with sensible defaults in `model.py`, overwritten
+by the trained `model.pt`). Output is `[lat, lon]` in raw degrees.
+
 | Spec requirement | Status in this branch |
 |---|---|
 | `prepare_data(csv_path) -> (X, y)` | ✅ `Img2GPS/preprocess.py` |
 | Image-path column aliases (`image_path`, `filepath`, `image`, `path`, `file_name`) | ✅ all accepted (`_resolve_column`) |
 | Lat / lon column aliases | ✅ all accepted |
 | `y` returned in raw degrees | ✅ |
+| Image resized to 224 × 224 (per spec recommendation) | ✅ `preprocess.IMAGE_SIZE = 224` |
 | `Model` / `IMG2GPS` class instantiable with no args | ✅ both present |
 | `get_model()` factory | ✅ |
 | `model.predict(batch)` returns `[lat, lon]` degrees | ✅ |
 | `model(batch)` returns `[lat, lon]` degrees | ✅ |
 | Target normalization stats hard-coded in `model.py` | ✅ `_TARGET_MEAN`, `_TARGET_STD` literals |
-| `model.pt` loadable via `torch.load` + `load_state_dict` (strict=False) | ✅ keys match |
-| Backend dependencies (`torch`, `torchvision`, `numpy`, `pandas`, `opencv-python`, `scikit-learn`) | ✅ pinned in `requirements.txt` |
+| Cluster centers default values hard-coded in `model.py` | ✅ `_DEFAULT_CLUSTER_CENTERS` (4×4 grid over the test rectangle) |
+| `model.pt` loadable via `torch.load` + `load_state_dict` (strict=False) | ✅ buffers + classifier weights round-trip cleanly |
+| Backend dependencies (`torch`, `torchvision`, `numpy`, `pandas`, `opencv-python`, `scikit-learn`) | ✅ pinned in `requirements.txt`; `train.py` uses `sklearn.cluster.KMeans` (in the allowed list) |
 | Runs cleanly through `Img2GPS/eval_project_a.py` | ✅ |
 
 **Files to send for the Project A submission:**

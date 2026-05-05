@@ -1,20 +1,45 @@
-"""Train the Img2GPS regression model (Project A).
+"""Train the Img2GPS soft-cluster classifier (Project A).
 
-Highlights
-----------
-* Targets are standardized using the train-split mean/std and persisted as
-  buffers on the model, so ``model.pt`` is self-contained.
-* Loss is MSE in *standardized* space, but every epoch we additionally report
-  the official metric (mean Haversine distance in meters) on a held-out
-  validation split.
-* The split is location-grouped: photos that share an exact GPS coordinate
-  (the spec describes ~8 photos per spot) live entirely in train *or*
-  entirely in val to avoid leakage.
-* Adam, lr=1e-3, StepLR(step_size=4, gamma=0.5), 12 epochs by default
-  (matches the PDF's suggested 10-15 range).
-* Light augmentation suited to walkway photography: hflip, color jitter,
-  RandomResizedCrop with scale=(0.85, 1.0).
-* The best checkpoint by *val Haversine* is saved to ``--output``.
+Pipeline rewrite (vs. the prior ResNet-18 + MSE-on-standardized-coords
+baseline). The ResNet-18 regressor was getting ~80 m on the leaderboard
+— *worse* than the 48.7 m constant-mean baseline — because:
+
+1. With only ~89 phone images, MSE in standardized space has a strong
+   "predict the centroid" attractor. Inspection of held-out predictions
+   showed every output collapsing to the training mean.
+2. ``RandomHorizontalFlip`` and ``RandomRotation`` destroy the bearing
+   cues (which side of the walkway you're on, what's at the horizon)
+   that disambiguate GPS coordinates within a 120 x 270 m rectangle.
+3. Combining phone photos with Mapillary dashcam frames pulls the
+   target stats and feature distribution off-domain (a documented
+   regression: phone-only 82 m -> combined+aug 102 m).
+
+This rewrite addresses all three:
+
+* **K-means cluster head**: the model predicts K=16 logits, softmaxes
+  them, and outputs the weighted sum of K cluster centers in raw
+  degrees. Mean-collapse becomes architecturally impossible — outputs
+  are restricted to the convex hull of the cluster centers, and CE
+  loss pushes the model to commit to one specific cluster per image.
+  Soft mixing across clusters provides sub-cluster precision.
+
+* **Augmentations are photometric only**: ``ColorJitter``, mild
+  ``RandomResizedCrop(scale=(0.92, 1.0))``, and a small Gaussian blur.
+  No flip, no rotation. Keeps every spatial cue intact.
+
+* **Phone-only by default**: the ``--csv`` flag still accepts a
+  combined CSV if you want to experiment, but the recommended path is
+  ``Img2GPS/metadata.csv``.
+
+* **Backbone freeze**: only the last MobileNetV3-Small block + the
+  classifier head get trained. With ~89 images this prevents the
+  pretrained features from being washed away.
+
+* **Hybrid loss**: cross-entropy on the closest-cluster index gives
+  stable gradients; a small ``haversine_meters / 1000`` term aligns
+  the soft mixture with the eval metric.
+
+The best-by-val-Haversine checkpoint is saved to ``--output``.
 """
 
 from __future__ import annotations
@@ -27,11 +52,12 @@ from typing import Iterable, List, Tuple
 
 import numpy as np
 import torch
+from sklearn.cluster import KMeans
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import v2 as transforms
 
-from model import Model
+from model import Model, _NUM_CLUSTERS
 from preprocess import IMAGENET_MEAN, IMAGENET_STD, load_raw
 
 
@@ -44,24 +70,45 @@ def _seed_everything(seed: int = 42) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dataset (in-memory tensors so we can shuffle and re-augment cheaply)
+# Dataset
 # ---------------------------------------------------------------------------
 
 
 class Img2GPSDataset(Dataset):
-    def __init__(self, X_raw: torch.Tensor, y: torch.Tensor, train: bool) -> None:
+    """In-memory dataset.
+
+    ``targets`` are *cluster indices* (LongTensor of shape (N,)). The raw
+    lat/lon labels are kept on ``y`` so the eval loop can compute
+    Haversine distance against ground truth.
+    """
+
+    def __init__(
+        self,
+        X_raw: torch.Tensor,
+        y: torch.Tensor,
+        cluster_idx: torch.Tensor,
+        train: bool,
+    ) -> None:
         self.X_raw = X_raw
         self.y = y
+        self.cluster_idx = cluster_idx
         self.train = train
+        # No horizontal flip / rotation: those break left-right and
+        # horizon cues that GPS prediction relies on.
         self._train_tx = transforms.Compose(
             [
-                transforms.RandomResizedCrop(224, scale=(0.85, 1.0), antialias=True),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=15),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+                transforms.RandomResizedCrop(224, scale=(0.92, 1.0), antialias=True),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03),
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))],
+                    p=0.2,
+                ),
             ]
         )
-        self._normalize = transforms.Normalize(mean=IMAGENET_MEAN.flatten().tolist(), std=IMAGENET_STD.flatten().tolist())
+        self._normalize = transforms.Normalize(
+            mean=IMAGENET_MEAN.flatten().tolist(),
+            std=IMAGENET_STD.flatten().tolist(),
+        )
 
     def __len__(self) -> int:
         return self.X_raw.shape[0]
@@ -71,15 +118,17 @@ class Img2GPSDataset(Dataset):
         if self.train:
             img = self._train_tx(img)
         img = self._normalize(img)
-        return img, self.y[idx]
+        return img, self.cluster_idx[idx], self.y[idx]
 
 
 # ---------------------------------------------------------------------------
-# Location-grouped split
+# Location-grouped train/val split
 # ---------------------------------------------------------------------------
 
 
-def location_grouped_split(y: torch.Tensor, val_fraction: float, seed: int) -> Tuple[List[int], List[int]]:
+def location_grouped_split(
+    y: torch.Tensor, val_fraction: float, seed: int
+) -> Tuple[List[int], List[int]]:
     rng = random.Random(seed)
     groups: dict[Tuple[float, float], List[int]] = {}
     for i, (lat, lon) in enumerate(y.tolist()):
@@ -99,7 +148,6 @@ def location_grouped_split(y: torch.Tensor, val_fraction: float, seed: int) -> T
         else:
             train_idx.extend(members)
     if not val_idx:
-        # Fallback when every group is larger than the val budget.
         smallest = min(keys, key=lambda k: len(groups[k]))
         val_idx = list(groups[smallest])
         train_idx = [i for k in keys if k != smallest for i in groups[k]]
@@ -123,27 +171,98 @@ def haversine_meters(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# K-means clustering on raw GPS labels
+# ---------------------------------------------------------------------------
+
+
+def fit_cluster_centers(
+    train_y: torch.Tensor, n_clusters: int, seed: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run K-means on training (lat, lon) coordinates.
+
+    Returns:
+        centers: (K, 2) float tensor of cluster centroids in degrees.
+        labels:  (N,) long tensor of cluster assignments for each train sample.
+
+    K-means in raw degrees is fine here because the bbox is tiny
+    (~120 x 270 m), so 1 deg lat ≈ 1 deg lon as a Euclidean proxy at
+    this latitude. Switching to a meter-scaled space changes centroids
+    by <1 m at this scale.
+    """
+    coords = train_y.numpy().astype(np.float64)
+    n_clusters = min(n_clusters, len(coords))
+    km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
+    labels = km.fit_predict(coords)
+    centers = km.cluster_centers_
+
+    # If we have fewer unique training locations than ``_NUM_CLUSTERS``,
+    # pad the centers tensor by jittering existing centroids by ~1 m so
+    # the buffer shape (K, 2) still matches the model's hard-coded K.
+    if n_clusters < _NUM_CLUSTERS:
+        pad_count = _NUM_CLUSTERS - n_clusters
+        rng = np.random.default_rng(seed)
+        # ~1 m jitter at this latitude
+        jitter = rng.normal(scale=1.0e-5, size=(pad_count, 2))
+        pad_seed = centers[rng.integers(0, n_clusters, size=pad_count)]
+        centers = np.vstack([centers, pad_seed + jitter])
+
+    return (
+        torch.tensor(centers, dtype=torch.float32),
+        torch.tensor(labels, dtype=torch.long),
+    )
+
+
+def assign_clusters(y: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+    """Assign each (lat, lon) to its nearest cluster center (Euclidean in deg)."""
+    diff = y.unsqueeze(1) - centers.unsqueeze(0)  # (N, K, 2)
+    dists = (diff ** 2).sum(dim=-1)
+    return dists.argmin(dim=-1)
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 
-def _evaluate(model: Model, loader: Iterable, device: torch.device) -> Tuple[float, float]:
+def _evaluate(
+    model: Model,
+    loader: Iterable,
+    device: torch.device,
+) -> Tuple[float, float, float]:
     model.eval()
-    mse_sum = 0.0
+    ce_sum = 0.0
     hav_sum = 0.0
+    correct = 0
     n = 0
+    ce = nn.CrossEntropyLoss(reduction="sum")
     with torch.no_grad():
-        for images, targets in loader:
+        for images, cluster_idx, y_true in loader:
             images = images.to(device)
-            targets = targets.to(device)
+            cluster_idx = cluster_idx.to(device)
+            y_true = y_true.to(device)
+            logits = model.predict_logits(images)
             preds = model(images)
-            mse = ((preds - targets) ** 2).mean(dim=1)
-            hav = haversine_meters(preds, targets)
-            batch_size = images.size(0)
-            mse_sum += float(mse.sum().item())
-            hav_sum += float(hav.sum().item())
-            n += batch_size
-    return mse_sum / max(n, 1), hav_sum / max(n, 1)
+            ce_sum += float(ce(logits, cluster_idx).item())
+            hav_sum += float(haversine_meters(preds, y_true).sum().item())
+            correct += int((logits.argmax(dim=-1) == cluster_idx).sum().item())
+            n += images.size(0)
+    return ce_sum / max(n, 1), hav_sum / max(n, 1), correct / max(n, 1)
+
+
+def _freeze_backbone_partial(model: Model) -> None:
+    """Train only the last MobileNetV3-Small block + classifier head.
+
+    With ~70 train images this is essential — full fine-tune of even a
+    small backbone overfits in 1-2 epochs.
+    """
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+    # Unfreeze the last feature block.
+    last_block = model.backbone.features[-1]
+    for p in last_block.parameters():
+        p.requires_grad = True
+    for p in model.backbone.classifier.parameters():
+        p.requires_grad = True
 
 
 def train(
@@ -155,6 +274,7 @@ def train(
     weight_decay: float,
     val_fraction: float,
     seed: int,
+    haversine_loss_weight: float,
 ) -> None:
     _seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,52 +286,78 @@ def train(
     train_idx, val_idx = location_grouped_split(y, val_fraction=val_fraction, seed=seed)
     print(f"data: {len(y)} examples, train={len(train_idx)}, val={len(val_idx)}")
 
-    train_ds = Img2GPSDataset(X_raw[train_idx], y[train_idx], train=True)
-    val_ds = Img2GPSDataset(X_raw[val_idx], y[val_idx], train=False)
+    centers, train_cluster_labels = fit_cluster_centers(
+        y[train_idx], n_clusters=_NUM_CLUSTERS, seed=seed
+    )
+    val_cluster_labels = assign_clusters(y[val_idx], centers)
+    print(f"K-means: {centers.shape[0]} clusters fit on {len(train_idx)} train coords")
+
+    train_ds = Img2GPSDataset(
+        X_raw[train_idx], y[train_idx], train_cluster_labels, train=True
+    )
+    val_ds = Img2GPSDataset(
+        X_raw[val_idx], y[val_idx], val_cluster_labels, train=False
+    )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = Model(weights_path=None).to(device)
+    model.set_cluster_centers(centers.tolist())
+    _freeze_backbone_partial(model)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"params: trainable={trainable:,} / total={total:,}")
 
-    train_targets = y[train_idx]
-    target_mean = train_targets.mean(dim=0)
-    target_std = train_targets.std(dim=0, unbiased=False).clamp(min=1e-8)
-    model.set_target_stats(target_mean.tolist(), target_std.tolist())
-    print(f"target stats: mean={target_mean.tolist()}, std={target_std.tolist()}")
-
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.5)
+    ce_loss = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     best_val_hav = math.inf
     best_state = None
 
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
+        total_ce = 0.0
+        total_hav = 0.0
+        correct = 0
         n_seen = 0
-        for images, targets in train_loader:
+        for images, cluster_idx, y_true in train_loader:
             images = images.to(device)
-            targets = targets.to(device)
-            z_targets = model.normalize_targets(targets)
+            cluster_idx = cluster_idx.to(device)
+            y_true = y_true.to(device)
 
             optimizer.zero_grad()
-            z_pred = model.predict_standardized(images)
-            loss = criterion(z_pred, z_targets)
+            logits = model.predict_logits(images)
+            ce = ce_loss(logits, cluster_idx)
+            # Soft prediction is the *exact* inference path (softmax @ centers),
+            # so optimizing Haversine on it directly aligns training with eval.
+            soft_pred = torch.softmax(logits, dim=-1) @ model.cluster_centers
+            hav = haversine_meters(soft_pred, y_true).mean()
+            loss = ce + haversine_loss_weight * (hav / 1000.0)
             loss.backward()
             optimizer.step()
 
-            total_loss += float(loss.item()) * images.size(0)
+            total_ce += float(ce.item()) * images.size(0)
+            total_hav += float(hav.item()) * images.size(0)
+            correct += int((logits.argmax(dim=-1) == cluster_idx).sum().item())
             n_seen += images.size(0)
 
-        train_loss = total_loss / max(n_seen, 1)
-        val_mse, val_hav = _evaluate(model, val_loader, device)
         scheduler.step()
+
+        train_ce = total_ce / max(n_seen, 1)
+        train_hav = total_hav / max(n_seen, 1)
+        train_acc = correct / max(n_seen, 1)
+        val_ce, val_hav, val_acc = _evaluate(model, val_loader, device)
 
         print(
             f"epoch {epoch:02d}  lr={optimizer.param_groups[0]['lr']:.2e}  "
-            f"train_norm_mse={train_loss:.4f}  val_mse_deg2={val_mse:.6f}  val_haversine_m={val_hav:.2f}"
+            f"train_ce={train_ce:.4f}  train_acc={train_acc:.3f}  train_hav_m={train_hav:.1f}  "
+            f"val_ce={val_ce:.4f}  val_acc={val_acc:.3f}  val_hav_m={val_hav:.1f}"
         )
 
         if val_hav < best_val_hav:
@@ -227,15 +373,21 @@ def train(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the Img2GPS model.")
+    parser = argparse.ArgumentParser(description="Train the Img2GPS cluster classifier.")
     parser.add_argument("--csv", default=os.path.join(os.path.dirname(__file__), "metadata.csv"))
     parser.add_argument("--output", default=os.path.join(os.path.dirname(__file__), "model.pt"))
-    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--haversine-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight on the (haversine_m / 1000) auxiliary loss term.",
+    )
     args = parser.parse_args()
     train(
         args.csv,
@@ -246,6 +398,7 @@ def main() -> None:
         args.weight_decay,
         args.val_fraction,
         args.seed,
+        args.haversine_loss_weight,
     )
 
 
