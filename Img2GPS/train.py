@@ -385,8 +385,12 @@ def main() -> None:
     parser.add_argument(
         "--haversine-loss-weight",
         type=float,
-        default=0.1,
-        help="Weight on the (haversine_m / 1000) auxiliary loss term.",
+        default=0.5,
+        help=(
+            "Weight on the (haversine_m / 1000) auxiliary loss term. With "
+            "K=80 (instance-retrieval regime) CE per-class signal is noisy "
+            "and the Haversine term needs to do more of the work."
+        ),
     )
     args = parser.parse_args()
     train(

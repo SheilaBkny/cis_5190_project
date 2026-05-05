@@ -61,26 +61,33 @@ _DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mod
 _TARGET_MEAN = (39.951541900634766, -75.19132232666016)
 _TARGET_STD = (0.0002309196861460805, 0.0005374249303713441)
 
-# Number of location clusters. Chosen for the Penn campus test rectangle:
-# bbox is ~120 m x 270 m, so 16 cells averages ~30-50 m of inter-cluster
-# spacing — small enough that hitting the right cluster keeps Haversine
-# error in the 15-25 m range, large enough that each cluster sees several
-# training images during fitting.
-_NUM_CLUSTERS = 16
+# Number of location clusters. With ~71 training images at ~48 unique GPS
+# locations, K=80 forces the cluster head into a near-instance-retrieval
+# regime: each cluster ends up with 1-2 training images and ``softmax @
+# centers`` behaves like a soft kNN over learned features. CE accuracy
+# becomes harder to interpret (chance is 1/80) but val Haversine is the
+# metric that matters.
+_NUM_CLUSTERS = 80
 
-# Default cluster centers: 4x4 lat/lon grid covering the test rectangle
-# (33rd & Walnut -> 34th & Spruce). Used only as a fallback when no
-# trained model.pt is loaded; ``train.py`` overwrites these via the
-# ``cluster_centers`` buffer with K-means centroids of the training set.
+# Default cluster centers: a ~10x8 lat/lon grid covering the test
+# rectangle (33rd & Walnut -> 34th & Spruce). Used only as a fallback
+# when no trained model.pt is loaded; ``train.py`` overwrites these via
+# the ``cluster_centers`` buffer with K-means centroids of the training
+# set. With K=80 we use grid_w * grid_h = 80 (10 columns x 8 rows).
 _LAT_LO, _LAT_HI = 39.9508, 39.9525
 _LON_LO, _LON_HI = -75.1928, -75.1900
+_DEFAULT_GRID_COLS = 10  # along longitude (EW span)
+_DEFAULT_GRID_ROWS = 8   # along latitude (NS span)
 _DEFAULT_CLUSTER_CENTERS = [
     [
-        _LAT_LO + (_LAT_HI - _LAT_LO) * (i // 4) / 3.0,
-        _LON_LO + (_LON_HI - _LON_LO) * (i % 4) / 3.0,
+        _LAT_LO + (_LAT_HI - _LAT_LO) * (i // _DEFAULT_GRID_COLS) / max(_DEFAULT_GRID_ROWS - 1, 1),
+        _LON_LO + (_LON_HI - _LON_LO) * (i % _DEFAULT_GRID_COLS) / max(_DEFAULT_GRID_COLS - 1, 1),
     ]
     for i in range(_NUM_CLUSTERS)
 ]
+assert len(_DEFAULT_CLUSTER_CENTERS) == _NUM_CLUSTERS, (
+    f"_DEFAULT_CLUSTER_CENTERS length {len(_DEFAULT_CLUSTER_CENTERS)} != _NUM_CLUSTERS {_NUM_CLUSTERS}"
+)
 
 
 # ---------------------------------------------------------------------------
