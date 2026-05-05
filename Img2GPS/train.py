@@ -33,11 +33,16 @@ so notebooks keep working):
                                 Temperature stays at default. Best for
                                 the final model AFTER picking T.
 
-Loss / metric: average Haversine distance in meters (the leaderboard
-metric, computed differentiably so we can autograd over T).
+Loss / metric: when fitting the softmax **temperature** T, we minimize
+**mean Haversine (meters)** on a location-grouped holdout — not MSE.
+(The legacy ResNet notebook still uses MSE; this script does not.)
 
 Augmentation: NONE at gallery-build time (we want canonical embeddings
 per photo). Light test-time augmentation can be added later in model.py.
+
+``--use-all-data``: the **gallery** uses every photo; T is still fit on
+a **location holdout** (same ``--val-fraction``) so the submit checkpoint
+gets a data-driven T without dropping rows from the gallery.
 """
 
 from __future__ import annotations
@@ -196,7 +201,7 @@ def _tune_temperature(
     val_emb: torch.Tensor,           # (N_v, D)
     val_gps: torch.Tensor,           # (N_v, 2)
     init_T: float = 20.0,
-    steps: int = 200,
+    steps: int = 800,
     lr: float = 1.0,
     log_prefix: str = "",
 ) -> Tuple[float, float]:
@@ -264,6 +269,7 @@ def _build_gallery_and_tune(
     val_idx: List[int],
     device: torch.device,
     log_prefix: str = "",
+    temp_steps: int = 800,
 ) -> Tuple[float, dict]:
     """Returns (val_haversine, payload_for_model_pt).
 
@@ -277,24 +283,37 @@ def _build_gallery_and_tune(
         val_emb = _embed_all(encoder, X_raw, val_idx, device)
         val_gps = y[val_idx].clone()
         T, val_hav = _tune_temperature(
-            train_emb, train_gps, val_emb, val_gps, log_prefix=log_prefix
+            train_emb,
+            train_gps,
+            val_emb,
+            val_gps,
+            steps=temp_steps,
+            log_prefix=log_prefix,
         )
     else:
         T, val_hav = 20.0, float("nan")
         print(f"{log_prefix}no val: temperature stays at default T={T:.2f}")
 
-    flat = dict(encoder.state_dict())                            # encoder.* keys
-    flat = {f"encoder.{k}": v for k, v in flat.items()}          # add wrapper prefix
-    flat["gallery_emb"] = train_emb.to(torch.float32)
-    flat["gallery_gps"] = train_gps.to(torch.float32)
-    flat["temperature"] = torch.tensor(float(T), dtype=torch.float32)
-    payload = {"state_dict": flat, "version": "dino_retrieval_v1"}
+    payload = _payload_from_gallery(encoder, train_emb, train_gps, T)
     return val_hav, payload
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+def _payload_from_gallery(
+    encoder: DinoVitS14,
+    gallery_emb: torch.Tensor,
+    gallery_gps: torch.Tensor,
+    temperature: float,
+) -> dict:
+    flat = {f"encoder.{k}": v for k, v in encoder.state_dict().items()}
+    flat["gallery_emb"] = gallery_emb.to(torch.float32)
+    flat["gallery_gps"] = gallery_gps.to(torch.float32)
+    flat["temperature"] = torch.tensor(float(temperature), dtype=torch.float32)
+    return {"state_dict": flat, "version": "dino_retrieval_v1"}
 
 
 def train(
@@ -305,6 +324,7 @@ def train(
     bootstrap_rounds: int = 0,
     use_all_data: bool = False,
     dinov2_weights: str | None = None,
+    temp_steps: int = 800,
 ) -> float:
     if use_all_data and bootstrap_rounds > 0:
         raise ValueError(
@@ -328,21 +348,47 @@ def train(
     print(f"encoder: DINOv2 ViT-S/14 (frozen), {sum(p.numel() for p in encoder.parameters()) / 1e6:.1f}M params")
 
     if use_all_data:
-        train_idx = list(range(len(y)))
-        print(f"data: {len(y)} examples, gallery={len(train_idx)}, val=0 (use-all-data)")
-        _, payload = _build_gallery_and_tune(
-            encoder=encoder, X_raw=X_raw, y=y,
-            train_idx=train_idx, val_idx=[], device=device,
+        all_idx = list(range(len(y)))
+        tune_tr, tune_va = location_grouped_split(
+            y, val_fraction=val_fraction, seed=seed
         )
+        T = 20.0
+        tune_hav = float("nan")
+        if tune_va:
+            tr_e = _embed_all(encoder, X_raw, tune_tr, device)
+            va_e = _embed_all(encoder, X_raw, tune_va, device)
+            T, tune_hav = _tune_temperature(
+                tr_e,
+                y[tune_tr],
+                va_e,
+                y[tune_va],
+                steps=temp_steps,
+                log_prefix="[all-data T] ",
+            )
+            print(
+                f"data: {len(y)} examples, gallery={len(all_idx)} (all photos); "
+                f"T fit on {len(tune_tr)} train locs / {len(tune_va)} val photos "
+                f"(holdout Haversine {tune_hav:.2f} m)"
+            )
+        else:
+            print(
+                f"data: {len(y)} examples, gallery={len(all_idx)} (all photos); "
+                f"no loc-holdout for T -> default T={T:.2f}"
+            )
+        full_emb = _embed_all(encoder, X_raw, all_idx, device)
+        full_gps = y[all_idx].clone()
+        payload = _payload_from_gallery(encoder, full_emb, full_gps, T)
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
         torch.save(payload, output_path)
         print(f"saved gallery checkpoint to {output_path}")
         print(
             "RESULT mode=all_data "
             f"seed={seed} bootstrap_rounds=0 "
-            f"val_haversine_m=nan val_haversine_m_mean=nan val_haversine_m_std=0.0000"
+            f"val_haversine_m={tune_hav:.4f} "
+            f"val_haversine_m_mean={tune_hav:.4f} "
+            f"val_haversine_m_std=0.0000"
         )
-        return float("nan")
+        return tune_hav
 
     if bootstrap_rounds > 0:
         oob_havs: List[float] = []
@@ -362,6 +408,7 @@ def train(
                 encoder=encoder, X_raw=X_raw, y=y,
                 train_idx=train_idx, val_idx=val_idx, device=device,
                 log_prefix=f"[r{r+1}] ",
+                temp_steps=temp_steps,
             )
             oob_havs.append(val_hav)
             if val_hav < best_round_hav:
@@ -396,6 +443,7 @@ def train(
     val_hav, payload = _build_gallery_and_tune(
         encoder=encoder, X_raw=X_raw, y=y,
         train_idx=train_idx, val_idx=val_idx, device=device,
+        temp_steps=temp_steps,
     )
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     torch.save(payload, output_path)
@@ -430,7 +478,17 @@ def main() -> None:
     parser.add_argument(
         "--use-all-data",
         action="store_true",
-        help="Use every photo as gallery; no val tune (T at default).",
+        help=(
+            "Gallery = every photo. Temperature T is still fit by Haversine on a "
+            "location-grouped holdout (see --val-fraction); holdout photos remain "
+            "in the gallery."
+        ),
+    )
+    parser.add_argument(
+        "--temp-steps",
+        type=int,
+        default=800,
+        help="Adam steps for Haversine minimization over softmax temperature T.",
     )
     parser.add_argument(
         "--dinov2-weights",
@@ -449,6 +507,7 @@ def main() -> None:
         bootstrap_rounds=args.bootstrap_rounds,
         use_all_data=args.use_all_data,
         dinov2_weights=args.dinov2_weights,
+        temp_steps=args.temp_steps,
     )
 
 
