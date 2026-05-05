@@ -1,101 +1,77 @@
-"""Preprocessing for News Source Classification (Project B submission).
-
-The backend gives a CSV with a `url` column only. We:
-  1. Derive the label from the domain (foxnews.com -> "FoxNews", else "NBC").
-  2. Scrape the headline using requests + BeautifulSoup, matching the example
-     in the project guideline (§3.4): targeted h1 selectors per outlet.
-  3. Fall back to the URL slug if scraping fails — slugs share most of the
-     headline's vocabulary, so the TF-IDF model degrades gracefully.
-
-Returns (X, y): a list of cleaned headline strings and a list of label strings.
-"""
-
-import re
-import unicodedata
-import warnings
+import os
 from typing import List, Tuple
-from urllib.parse import urlparse
 
+import cv2
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from urllib3.exceptions import InsecureRequestWarning
-
-warnings.simplefilter("ignore", InsecureRequestWarning)
+import torch
 
 
-_USER_AGENT = "Mozilla/5.0 (compatible; CIS5190ProjectB/1.0)"
-_TIMEOUT = 5.0
-_WS_RE = re.compile(r"\s+")
+IMAGE_SIZE = 224
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
-def _clean_text(text: str) -> str:
-    """Same normalization as preprocess.ipynb so train/inference text matches."""
-    text = unicodedata.normalize("NFKC", str(text))
-    text = text.replace("‘", "'").replace("’", "'")
-    text = text.replace("“", '"').replace("”", '"')
-    text = text.replace("–", "-").replace("—", "-")
-    return _WS_RE.sub(" ", text).strip()
+def _resolve_column(columns: List[str], aliases: List[str]) -> str:
+    for name in aliases:
+        if name in columns:
+            return name
+    lower_to_original = {name.lower(): name for name in columns}
+    for name in aliases:
+        if name.lower() in lower_to_original:
+            return lower_to_original[name.lower()]
+    raise KeyError(f"Could not find any of columns {aliases} in CSV columns {columns}")
 
 
-def _label_from_url(url: str) -> str:
-    return "FoxNews" if "foxnews" in url.lower() else "NBC"
+def _resolve_image_path(csv_path: str, image_value: str) -> str:
+    image_value = str(image_value)
+    if os.path.isabs(image_value) and os.path.exists(image_value):
+        return image_value
 
-
-def _slug_text(url: str) -> str:
-    p = urlparse(url)
-    parts = [s for s in p.path.split("/") if s]
-    if not parts:
-        return ""
-    slug = parts[-1]
-    if slug.endswith(".print"):
-        slug = slug[: -len(".print")]
-    slug = slug.replace("-", " ").replace("_", " ")
-    return _clean_text(slug)
-
-
-def _scrape_headline(url: str) -> str:
-    try:
-        response = requests.get(
-            url, headers={"User-Agent": _USER_AGENT}, timeout=_TIMEOUT, verify=False
-        )
-        if response.status_code != 200:
-            return ""
-        soup = BeautifulSoup(response.text, "html.parser")
-    except Exception:
-        return ""
-
-    # Outlet-specific selectors. Fox example shown in project guideline §3.4.
     candidates = [
-        ("h1", {"class": "headline speakable"}),                       # Fox News
-        ("h1", {"class": re.compile(r"article-hero-headline__htag")}), # NBC News
+        image_value,
+        os.path.join(os.path.dirname(csv_path), image_value),
+        os.path.join(os.path.dirname(csv_path), "images", image_value),
+        os.path.join(os.getcwd(), image_value),
+        os.path.join(os.getcwd(), "data", "images", image_value),
     ]
-    for tag, attrs in candidates:
-        node = soup.find(tag, attrs=attrs)
-        if node and node.get_text(strip=True):
-            return _clean_text(node.get_text())
-
-    h1 = soup.find("h1")
-    if h1 and h1.get_text(strip=True):
-        return _clean_text(h1.get_text())
-    title = soup.find("title")
-    if title and title.get_text(strip=True):
-        return _clean_text(title.get_text())
-    return ""
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"Could not locate image '{image_value}' for CSV '{csv_path}'")
 
 
-def _text_for_url(url: str) -> str:
-    headline = _scrape_headline(url)
-    if headline:
-        return headline
-    return _slug_text(url)
+def _load_image(path: str) -> torch.Tensor:
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f"Could not read image: {path}")
+
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
+    tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+    return (tensor - IMAGENET_MEAN) / IMAGENET_STD
 
 
-def prepare_data(csv_path: str) -> Tuple[List[str], List[str]]:
+def prepare_data(csv_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load Img2GPS examples from a metadata CSV.
+
+    Returns:
+        X: float tensor with shape (N, 3, 224, 224), ImageNet-normalized.
+        y: float tensor with shape (N, 2), raw [latitude, longitude] degrees.
+    """
     df = pd.read_csv(csv_path)
-    url_col = next((c for c in df.columns if c.lower() == "url"), df.columns[0])
-    urls = df[url_col].astype(str).tolist()
+    columns = df.columns.tolist()
+    image_col = _resolve_column(columns, ["image_path", "path", "filepath", "file_path", "filename", "file_name"])
+    lat_col = _resolve_column(columns, ["Latitude", "latitude", "lat"])
+    lon_col = _resolve_column(columns, ["Longitude", "longitude", "lon", "lng"])
 
-    X = [_text_for_url(u) for u in urls]
-    y = [_label_from_url(u) for u in urls]
+    images = []
+    labels = []
+    for _, row in df.iterrows():
+        image_path = _resolve_image_path(csv_path, row[image_col])
+        images.append(_load_image(image_path))
+        labels.append([float(row[lat_col]), float(row[lon_col])])
+
+    X = torch.stack(images, dim=0) if images else torch.empty(0, 3, IMAGE_SIZE, IMAGE_SIZE)
+    y = torch.tensor(labels, dtype=torch.float32) if labels else torch.empty(0, 2)
     return X, y
