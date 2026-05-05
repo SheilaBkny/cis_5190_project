@@ -18,7 +18,9 @@ Img2GPS/
 ├── train.py              # training loop (lr=1e-3, StepLR, location split, aug)
 ├── notebooks/
 │   └── img2gps.ipynb     # walkthrough: data → train → eval → vis
-└── reference/            # course-provided sanity-check examples
+├── reference/            # course-provided sanity-check examples
+└── scripts/
+    └── fetch_mapillary.py  # optional: pull extra training images from Mapillary
 ```
 
 Source images live under `../data/images` (HEIC) and
@@ -62,3 +64,29 @@ The training script prints per-epoch `train_norm_mse`, `val_mse_deg2`, and
   10–15 range).
 * **Caching**: `preprocess.py` writes `<csv_dir>/.cache/<csv_stem>.{raw,norm}.pt`
   and reuses them while the CSV file mtime hasn't advanced.
+
+## Extra training data (optional)
+
+Walking the test region by hand is the cleanest source, but the spec
+test set lives in a tiny ~150 × 110 m rectangle — `scripts/fetch_mapillary.py`
+can pull additional georeferenced street-level images of the same area
+from [Mapillary](https://www.mapillary.com/) (CC-BY-SA, ML use is
+explicitly permitted by their ToU §12). **Do not** use Google Street
+View: §3(c)(vii) of the Maps Platform terms forbids using its content
+to "train, test, validate or fine-tune" ML models.
+
+```bash
+export MAPILLARY_TOKEN="MLY|<your client token>"
+python Img2GPS/scripts/fetch_mapillary.py probe \
+    --bbox=-75.19297,39.95026,-75.18949,39.95291
+python Img2GPS/scripts/fetch_mapillary.py download \
+    --bbox=-75.19297,39.95026,-75.18949,39.95291 \
+    --out=data/mapillary --limit=200 --skip-pano
+```
+
+The download writes a `metadata_mapillary.csv` in the same
+`image_path,latitude,longitude` schema as `metadata.csv`, so you can
+either point `train.py --csv` at it directly or concatenate the two.
+Caveat: Mapillary photos are typically captured from car/bike rigs and
+are a noticeable domain shift from a phone held upright on walkways —
+mix them with your own photos rather than replacing them.

@@ -13,7 +13,10 @@ venv/
 metrics/
 **/.cache/
 *.cache.pt
+Img2GPS/metadata_combined.csv
 
 # Bulky downloaded resources / non-source archives
 *.zip
 *.pdf
+
+.env
