@@ -98,11 +98,24 @@ class Model(nn.Module):
         z = self.backbone(x.float())
         return z * self.y_std + self.y_mean
 
+    # Test-time augmentation: average the model's prediction on the
+    # original image and its horizontal flip. H-flip is safe to apply
+    # after ImageNet normalization (it's a pure spatial reordering of
+    # pixels) and gives a small but reliable improvement on the leaderboard
+    # because the regression head's noise is partially uncorrelated across
+    # the two views. Doubles inference time (still well under spec budget).
+    USE_TTA_HFLIP: bool = True
+
     def predict(self, batch: Iterable[torch.Tensor]) -> torch.Tensor:
         device = next(self.parameters()).device
         with torch.no_grad():
-            x = torch.stack([self._to_tensor(item) for item in batch], dim=0).to(device)
-            return self.forward(x).cpu()
+            x = torch.stack([self._to_tensor(item) for item in batch], dim=0).to(device).float()
+            z = self.backbone(x)
+            if self.USE_TTA_HFLIP:
+                z_flip = self.backbone(torch.flip(x, dims=[-1]))
+                z = (z + z_flip) * 0.5
+            preds = z * self.y_std + self.y_mean
+            return preds.cpu()
 
     @staticmethod
     def _to_tensor(x) -> torch.Tensor:
