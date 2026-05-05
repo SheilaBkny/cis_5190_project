@@ -13,12 +13,13 @@ baseline). The ResNet-18 regressor was getting ~80 m on the leaderboard
 
 This rewrite addresses both:
 
-* **K-means cluster head**: the model predicts K=16 logits, softmaxes
-  them, and outputs the weighted sum of K cluster centers in raw
-  degrees. Mean-collapse becomes architecturally impossible — outputs
-  are restricted to the convex hull of the cluster centers, and CE
-  loss pushes the model to commit to one specific cluster per image.
-  Soft mixing across clusters provides sub-cluster precision.
+* **K-means cluster head**: the model predicts ``K`` logits
+  (``--num-clusters`` flag, default 80), softmaxes them, and outputs
+  the weighted sum of ``K`` cluster centers in raw degrees.
+  Mean-collapse becomes architecturally impossible — outputs are
+  restricted to the convex hull of the cluster centers, and CE loss
+  pushes the model to commit to one specific cluster per image. Soft
+  mixing across clusters provides sub-cluster precision.
 
 * **Augmentations are photometric only**: ``ColorJitter``, mild
   ``RandomResizedCrop(scale=(0.92, 1.0))``, and a small Gaussian blur.
@@ -184,22 +185,24 @@ def fit_cluster_centers(
     (~120 x 270 m), so 1 deg lat ≈ 1 deg lon as a Euclidean proxy at
     this latitude. Switching to a meter-scaled space changes centroids
     by <1 m at this scale.
+
+    If we have fewer unique training locations than the requested K,
+    sklearn caps the number of distinct clusters and we pad the
+    centers tensor by jittering existing centroids by ~1 m so the
+    buffer shape (K, 2) still matches the model's classifier head.
     """
+    target_k = int(n_clusters)
     coords = train_y.numpy().astype(np.float64)
-    n_clusters = min(n_clusters, len(coords))
-    km = KMeans(n_clusters=n_clusters, random_state=seed, n_init=10)
+    fit_k = min(target_k, len(coords))
+    km = KMeans(n_clusters=fit_k, random_state=seed, n_init=10)
     labels = km.fit_predict(coords)
     centers = km.cluster_centers_
 
-    # If we have fewer unique training locations than ``_NUM_CLUSTERS``,
-    # pad the centers tensor by jittering existing centroids by ~1 m so
-    # the buffer shape (K, 2) still matches the model's hard-coded K.
-    if n_clusters < _NUM_CLUSTERS:
-        pad_count = _NUM_CLUSTERS - n_clusters
+    if fit_k < target_k:
+        pad_count = target_k - fit_k
         rng = np.random.default_rng(seed)
-        # ~1 m jitter at this latitude
         jitter = rng.normal(scale=1.0e-5, size=(pad_count, 2))
-        pad_seed = centers[rng.integers(0, n_clusters, size=pad_count)]
+        pad_seed = centers[rng.integers(0, fit_k, size=pad_count)]
         centers = np.vstack([centers, pad_seed + jitter])
 
     return (
@@ -271,7 +274,8 @@ def train(
     val_fraction: float,
     seed: int,
     haversine_loss_weight: float,
-) -> None:
+    num_clusters: int = _NUM_CLUSTERS,
+) -> float:
     _seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -283,7 +287,7 @@ def train(
     print(f"data: {len(y)} examples, train={len(train_idx)}, val={len(val_idx)}")
 
     centers, train_cluster_labels = fit_cluster_centers(
-        y[train_idx], n_clusters=_NUM_CLUSTERS, seed=seed
+        y[train_idx], n_clusters=num_clusters, seed=seed
     )
     val_cluster_labels = assign_clusters(y[val_idx], centers)
     print(f"K-means: {centers.shape[0]} clusters fit on {len(train_idx)} train coords")
@@ -298,7 +302,7 @@ def train(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    model = Model(weights_path=None).to(device)
+    model = Model(weights_path=None, num_clusters=num_clusters).to(device)
     model.set_cluster_centers(centers.tolist())
     _freeze_backbone_partial(model)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -366,6 +370,20 @@ def train(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     torch.save(best_state, output_path)
     print(f"best val_haversine_m={best_val_hav:.2f}  saved to {output_path}")
+    # Single-line machine-readable summary so notebook sweeps can grep
+    # this out of stdout. Keep field names stable.
+    print(
+        "RESULT "
+        f"k={num_clusters} "
+        f"lr={lr:g} "
+        f"hav_w={haversine_loss_weight:g} "
+        f"epochs={epochs} "
+        f"batch_size={batch_size} "
+        f"weight_decay={weight_decay:g} "
+        f"seed={seed} "
+        f"val_haversine_m={best_val_hav:.4f}"
+    )
+    return best_val_hav
 
 
 def main() -> None:
@@ -379,13 +397,24 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--num-clusters",
+        type=int,
+        default=_NUM_CLUSTERS,
+        help=(
+            "K, the number of K-means location clusters. The classifier "
+            "head is sized to K, and ``cluster_centers`` is a (K, 2) "
+            "buffer overwritten with the K-means centroids of the "
+            "training split."
+        ),
+    )
+    parser.add_argument(
         "--haversine-loss-weight",
         type=float,
         default=0.5,
         help=(
-            "Weight on the (haversine_m / 1000) auxiliary loss term. With "
-            "K=80 (instance-retrieval regime) CE per-class signal is noisy "
-            "and the Haversine term needs to do more of the work."
+            "Weight on the (haversine_m / 1000) auxiliary loss term. "
+            "Larger K (instance-retrieval regime) makes CE per-class "
+            "signal noisier and benefits from a larger Haversine term."
         ),
     )
     args = parser.parse_args()
@@ -399,6 +428,7 @@ def main() -> None:
         args.val_fraction,
         args.seed,
         args.haversine_loss_weight,
+        args.num_clusters,
     )
 
 

@@ -33,15 +33,17 @@ Spec compliance (Project_submission.pdf §3.1):
 * ``forward(batch)`` returns ``[lat, lon]`` in raw degrees.           ✓
 * ``predict(batch)`` accepts a list/tensor of inputs.                 ✓
 * Target normalization stats (``_TARGET_MEAN``, ``_TARGET_STD``) are
-  hard-coded in this file. Cluster centers also have hard-coded
-  defaults (``_DEFAULT_CLUSTER_CENTERS``) that ``model.pt`` overrides
-  via ``load_state_dict``. The defaults form a 4x4 grid over the Penn
-  test rectangle so that even a weights-less instantiation produces
-  geographically plausible (if uninformative) predictions.
+  hard-coded in this file. Cluster centers also have a hard-coded
+  default (``_build_default_centers``) — a near-square lat/lon grid
+  over the Penn test rectangle — that ``model.pt`` overrides via
+  ``load_state_dict`` with K-means centroids of the training set. K
+  itself is auto-detected from the checkpoint at construction time so
+  zero-arg ``Model()`` works regardless of which K was trained.
 """
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Iterable, Optional, Sequence
 
@@ -61,33 +63,60 @@ _DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mod
 _TARGET_MEAN = (39.951541900634766, -75.19132232666016)
 _TARGET_STD = (0.0002309196861460805, 0.0005374249303713441)
 
-# Number of location clusters. With ~71 training images at ~48 unique GPS
-# locations, K=80 forces the cluster head into a near-instance-retrieval
-# regime: each cluster ends up with 1-2 training images and ``softmax @
-# centers`` behaves like a soft kNN over learned features. CE accuracy
-# becomes harder to interpret (chance is 1/80) but val Haversine is the
-# metric that matters.
+# Default number of location clusters when nothing else specifies K (no
+# checkpoint, no constructor argument). With ~71 training images and ~48
+# unique GPS locations, K=80 puts us in an instance-retrieval regime
+# where each cluster ends up with 1-2 training images. The actual K used
+# at inference time is whatever ``model.pt`` was trained with — the
+# constructor reads it from the checkpoint when available.
 _NUM_CLUSTERS = 80
 
-# Default cluster centers: a ~10x8 lat/lon grid covering the test
-# rectangle (33rd & Walnut -> 34th & Spruce). Used only as a fallback
-# when no trained model.pt is loaded; ``train.py`` overwrites these via
-# the ``cluster_centers`` buffer with K-means centroids of the training
-# set. With K=80 we use grid_w * grid_h = 80 (10 columns x 8 rows).
+# Bounding box used to seed default cluster centers when there is no
+# trained checkpoint to load (33rd & Walnut -> 34th & Spruce).
 _LAT_LO, _LAT_HI = 39.9508, 39.9525
 _LON_LO, _LON_HI = -75.1928, -75.1900
-_DEFAULT_GRID_COLS = 10  # along longitude (EW span)
-_DEFAULT_GRID_ROWS = 8   # along latitude (NS span)
-_DEFAULT_CLUSTER_CENTERS = [
-    [
-        _LAT_LO + (_LAT_HI - _LAT_LO) * (i // _DEFAULT_GRID_COLS) / max(_DEFAULT_GRID_ROWS - 1, 1),
-        _LON_LO + (_LON_HI - _LON_LO) * (i % _DEFAULT_GRID_COLS) / max(_DEFAULT_GRID_COLS - 1, 1),
-    ]
-    for i in range(_NUM_CLUSTERS)
-]
-assert len(_DEFAULT_CLUSTER_CENTERS) == _NUM_CLUSTERS, (
-    f"_DEFAULT_CLUSTER_CENTERS length {len(_DEFAULT_CLUSTER_CENTERS)} != _NUM_CLUSTERS {_NUM_CLUSTERS}"
-)
+
+
+def _build_default_centers(num_clusters: int) -> torch.Tensor:
+    """Generate a near-square lat/lon grid of ``num_clusters`` points
+    over the Penn test rectangle. Used only when ``model.pt`` is not
+    available; ``train.py`` always overwrites ``cluster_centers`` with
+    the K-means centroids of the training split before the first epoch.
+    """
+    if num_clusters <= 0:
+        raise ValueError(f"num_clusters must be positive, got {num_clusters}")
+    cols = max(1, int(round(math.sqrt(num_clusters))))
+    rows = max(1, math.ceil(num_clusters / cols))
+    pts = []
+    for i in range(num_clusters):
+        r = i // cols
+        c = i % cols
+        lat = _LAT_LO + (_LAT_HI - _LAT_LO) * (r / max(rows - 1, 1))
+        lon = _LON_LO + (_LON_HI - _LON_LO) * (c / max(cols - 1, 1))
+        pts.append([lat, lon])
+    return torch.tensor(pts, dtype=torch.float32)
+
+
+def _peek_num_clusters(weights_path: str) -> Optional[int]:
+    """Read K from a saved checkpoint without instantiating the model.
+
+    Looks for the ``cluster_centers`` buffer first, then falls back to
+    the final classifier weight's row count. Returns ``None`` on any
+    failure so callers can transparently fall back to the default K.
+    """
+    try:
+        ckpt = torch.load(weights_path, map_location="cpu")
+        sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        if not isinstance(sd, dict):
+            return None
+        if "cluster_centers" in sd:
+            return int(sd["cluster_centers"].shape[0])
+        for key, val in sd.items():
+            if key.endswith("classifier.3.weight") and hasattr(val, "shape"):
+                return int(val.shape[0])
+    except Exception:
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -124,22 +153,33 @@ class Model(nn.Module):
     raw lat/lon degrees, matching the Project A spec output contract.
     """
 
-    def __init__(self, weights_path: Optional[str] = _DEFAULT_WEIGHTS) -> None:
+    def __init__(
+        self,
+        weights_path: Optional[str] = _DEFAULT_WEIGHTS,
+        num_clusters: Optional[int] = None,
+    ) -> None:
         super().__init__()
+
+        # Resolve K: explicit constructor arg > checkpoint introspection
+        # > module-level default. This lets ``Model()`` (the spec-required
+        # zero-arg form) auto-pick up whatever K was trained, and lets
+        # the training loop pass an explicit K to experiment with.
+        if num_clusters is None and weights_path and os.path.exists(weights_path):
+            num_clusters = _peek_num_clusters(weights_path)
+        if num_clusters is None:
+            num_clusters = _NUM_CLUSTERS
+        self.num_clusters = int(num_clusters)
 
         self.backbone = _mobilenet_v3_small(pretrained=True)
         # MobileNetV3-Small classifier: Linear(576,1024) -> Hardswish ->
         # Dropout -> Linear(1024, num_classes). We keep the existing
         # bottleneck and only swap the final logit layer for K clusters.
         in_features = self.backbone.classifier[-1].in_features
-        self.backbone.classifier[-1] = nn.Linear(in_features, _NUM_CLUSTERS)
+        self.backbone.classifier[-1] = nn.Linear(in_features, self.num_clusters)
 
         # Buffers: persisted in ``model.pt`` so the trained centers and
         # legacy normalization stats round-trip correctly.
-        self.register_buffer(
-            "cluster_centers",
-            torch.tensor(_DEFAULT_CLUSTER_CENTERS, dtype=torch.float32),
-        )
+        self.register_buffer("cluster_centers", _build_default_centers(self.num_clusters))
         self.register_buffer("y_mean", torch.tensor(_TARGET_MEAN, dtype=torch.float32))
         self.register_buffer("y_std", torch.tensor(_TARGET_STD, dtype=torch.float32))
 
@@ -158,7 +198,7 @@ class Model(nn.Module):
 
     def set_cluster_centers(self, centers: Sequence[Sequence[float]]) -> None:
         """Overwrite ``cluster_centers`` (called by ``train.py`` after K-means)."""
-        centers_t = torch.as_tensor(centers, dtype=torch.float32).view(_NUM_CLUSTERS, 2)
+        centers_t = torch.as_tensor(centers, dtype=torch.float32).view(self.num_clusters, 2)
         self.cluster_centers.copy_(centers_t)
 
     def predict_logits(self, x: torch.Tensor) -> torch.Tensor:
