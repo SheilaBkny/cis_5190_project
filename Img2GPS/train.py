@@ -10,11 +10,8 @@ baseline). The ResNet-18 regressor was getting ~80 m on the leaderboard
 2. ``RandomHorizontalFlip`` and ``RandomRotation`` destroy the bearing
    cues (which side of the walkway you're on, what's at the horizon)
    that disambiguate GPS coordinates within a 120 x 270 m rectangle.
-3. Combining phone photos with Mapillary dashcam frames pulls the
-   target stats and feature distribution off-domain (a documented
-   regression: phone-only 82 m -> combined+aug 102 m).
 
-This rewrite addresses all three:
+This rewrite addresses both:
 
 * **K-means cluster head**: the model predicts K=16 logits, softmaxes
   them, and outputs the weighted sum of K cluster centers in raw
@@ -27,9 +24,8 @@ This rewrite addresses all three:
   ``RandomResizedCrop(scale=(0.92, 1.0))``, and a small Gaussian blur.
   No flip, no rotation. Keeps every spatial cue intact.
 
-* **Phone-only by default**: the ``--csv`` flag still accepts a
-  combined CSV if you want to experiment, but the recommended path is
-  ``Img2GPS/metadata.csv``.
+* **Phone-only training**: the ``--csv`` flag points at
+  ``Img2GPS/metadata.csv`` (the spec-collected phone images).
 
 * **Backbone freeze**: only the last MobileNetV3-Small block + the
   classifier head get trained. With ~89 images this prevents the
