@@ -16,16 +16,114 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
+import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import Dataset
 
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+IMAGENET_MEAN_LIST = [0.485, 0.456, 0.406]
+IMAGENET_STD_LIST = [0.229, 0.224, 0.225]
+
+
+# ---------------------------------------------------------------------------
+# Augmentation pipelines used by the released ResNet-18 baseline.
+#
+# Building these eagerly at import time means notebook cells just do
+# ``from preprocess import train_transform, inference_transform`` instead
+# of redefining the augmentation recipe inline.
+# ---------------------------------------------------------------------------
+
+
+def _build_transforms():
+    """Return ``(train_transform, inference_transform)`` matching the
+    course-released baseline notebook exactly:
+
+      * train: RandomResizedCrop(224, scale=(0.7, 1.0)) +
+        RandomHorizontalFlip + RandomRotation(15) +
+        ColorJitter(0.2, 0.2, 0.2, 0.1) + ImageNet Normalize.
+      * inference: ImageNet Normalize only (images already arrive at
+        224x224 from ``load_raw``).
+
+    Built lazily so this module stays importable in environments
+    without torchvision (e.g. the eval container).
+    """
+    from torchvision import transforms as T
+
+    train_tx = T.Compose(
+        [
+            T.RandomResizedCrop(224, scale=(0.7, 1.0)),
+            T.RandomHorizontalFlip(),
+            T.RandomRotation(degrees=15),
+            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            T.Normalize(mean=IMAGENET_MEAN_LIST, std=IMAGENET_STD_LIST),
+        ]
+    )
+    inference_tx = T.Compose(
+        [
+            T.Normalize(mean=IMAGENET_MEAN_LIST, std=IMAGENET_STD_LIST),
+        ]
+    )
+    return train_tx, inference_tx
+
+
+train_transform, inference_transform = _build_transforms()
+
+
+class LocalGPSImageDataset(Dataset):
+    """In-memory drop-in for the released ``GPSImageDataset``.
+
+    Backed by a tensor of pre-resized [0, 1] images (from
+    ``load_raw``) plus raw ``[lat, lon]`` labels. Yields
+    ``(image, [lat_norm, lon_norm])`` per item, with lat/lon
+    standardized using the **training-set** mean/std (computed once
+    from the train CSV and reused on the val/reference set, so val
+    coordinates are normalized with the same stats as training).
+
+    Attributes ``latitude_mean``, ``latitude_std``, ``longitude_mean``,
+    ``longitude_std`` are exposed so callers can denormalize model
+    outputs at inference time.
+    """
+
+    def __init__(
+        self,
+        X_raw: torch.Tensor,
+        y_raw: torch.Tensor,
+        transform=None,
+        lat_mean: Optional[float] = None,
+        lat_std: Optional[float] = None,
+        lon_mean: Optional[float] = None,
+        lon_std: Optional[float] = None,
+    ) -> None:
+        self.X_raw = X_raw
+        self.y_raw = y_raw
+        self.transform = transform
+
+        lats = y_raw[:, 0].numpy()
+        lons = y_raw[:, 1].numpy()
+        self.latitude_mean = float(lat_mean) if lat_mean is not None else float(np.mean(lats))
+        self.latitude_std = float(lat_std) if lat_std is not None else float(np.std(lats))
+        self.longitude_mean = float(lon_mean) if lon_mean is not None else float(np.mean(lons))
+        self.longitude_std = float(lon_std) if lon_std is not None else float(np.std(lons))
+        self.latitude_std = max(self.latitude_std, 1e-8)
+        self.longitude_std = max(self.longitude_std, 1e-8)
+
+    def __len__(self) -> int:
+        return self.X_raw.shape[0]
+
+    def __getitem__(self, idx: int):
+        image = self.X_raw[idx]  # (3, 224, 224) in [0, 1]
+        if self.transform is not None:
+            image = self.transform(image)
+        lat = (float(self.y_raw[idx, 0]) - self.latitude_mean) / self.latitude_std
+        lon = (float(self.y_raw[idx, 1]) - self.longitude_mean) / self.longitude_std
+        return image, torch.tensor([lat, lon], dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
