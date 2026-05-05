@@ -37,6 +37,13 @@ def _resnet18(pretrained: bool = True) -> nn.Module:
 
 _DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pt")
 
+# Target normalization stats hard-coded per the submission spec
+# ("If you use normalization, hard code the stats in your model.py").
+# These are the train-split statistics produced by the iter1 training run
+# (Img2GPS/train.py with seed=42 on Img2GPS/metadata.csv).
+_TARGET_MEAN = (39.951541900634766, -75.19132232666016)
+_TARGET_STD = (0.0002309196861460805, 0.0005374249303713441)
+
 
 class Model(nn.Module):
     """Img2GPS model used for both training and the official evaluator.
@@ -53,10 +60,12 @@ class Model(nn.Module):
         in_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Linear(in_features, 2)
 
-        # Defaults make `forward` an identity over the backbone output until a
-        # training run sets these via `set_target_stats`.
-        self.register_buffer("y_mean", torch.zeros(2))
-        self.register_buffer("y_std", torch.ones(2))
+        # Hard-coded train-split target stats (see top of file). These are
+        # also the values that `model.pt` carries, so loading weights is a
+        # no-op for the buffers; if `model.pt` is unavailable the model still
+        # returns meaningful degrees.
+        self.register_buffer("y_mean", torch.tensor(_TARGET_MEAN, dtype=torch.float32))
+        self.register_buffer("y_std", torch.tensor(_TARGET_STD, dtype=torch.float32))
 
         if weights_path and os.path.exists(weights_path):
             checkpoint = torch.load(weights_path, map_location="cpu")

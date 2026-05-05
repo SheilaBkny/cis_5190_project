@@ -121,7 +121,7 @@ def _save_cache(cache_file: Path, payload) -> None:
 def _read_csv_records(csv_path: str) -> Tuple[List[str], List[List[float]]]:
     df = pd.read_csv(csv_path)
     columns = df.columns.tolist()
-    image_col = _resolve_column(columns, ["image_path", "path", "filepath", "file_path", "filename", "file_name"])
+    image_col = _resolve_column(columns, ["image_path", "filepath", "image", "path", "file_name", "file_path", "filename"])
     lat_col = _resolve_column(columns, ["Latitude", "latitude", "lat"])
     lon_col = _resolve_column(columns, ["Longitude", "longitude", "lon", "lng"])
     paths = [_resolve_image_path(csv_path, row[image_col]) for _, row in df.iterrows()]

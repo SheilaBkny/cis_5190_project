@@ -13,4 +13,7 @@ venv/
 metrics/
 **/.cache/
 *.cache.pt
+
+# Bulky downloaded resources / non-source archives
+*.zip
 *.pdf
