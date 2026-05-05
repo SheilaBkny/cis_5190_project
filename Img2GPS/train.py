@@ -36,7 +36,22 @@ This rewrite addresses both:
   stable gradients; a small ``haversine_meters / 1000`` term aligns
   the soft mixture with the eval metric.
 
-The best-by-val-Haversine checkpoint is saved to ``--output``.
+Three split modes (only one applies per invocation):
+
+* **default** — single location-grouped train/val split. Saves the
+  best-by-val-Haversine checkpoint. Fast; useful for smoke tests.
+* **``--bootstrap-rounds B``** — run B independent training cycles,
+  each on a location-level bootstrap sample (locations drawn with
+  replacement; out-of-bag locations validate). RESULT reports mean ±
+  std OOB Haversine. Best for hyperparameter selection on a small
+  dataset: every example is validated *across* rounds, so no data is
+  permanently held out.
+* **``--use-all-data``** — train on every example, no val. Best for
+  the final model after picking the best config with bootstrap.
+
+The checkpoint at ``--output`` is the best-OOB-fold model in bootstrap
+mode, the final-epoch model in ``--use-all-data`` mode, and the
+best-by-val-Haversine model in the default single-split mode.
 """
 
 from __future__ import annotations
@@ -123,15 +138,23 @@ class Img2GPSDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-def location_grouped_split(
-    y: torch.Tensor, val_fraction: float, seed: int
-) -> Tuple[List[int], List[int]]:
-    rng = random.Random(seed)
+def _group_by_location(y: torch.Tensor) -> "dict[Tuple[float, float], List[int]]":
+    """Group dataset indices by their (rounded) GPS location."""
     groups: dict[Tuple[float, float], List[int]] = {}
     for i, (lat, lon) in enumerate(y.tolist()):
         key = (round(float(lat), 6), round(float(lon), 6))
         groups.setdefault(key, []).append(i)
+    return groups
 
+
+def location_grouped_split(
+    y: torch.Tensor, val_fraction: float, seed: int
+) -> Tuple[List[int], List[int]]:
+    """Single train/val split where photos sharing a GPS location are
+    kept entirely on one side of the split.
+    """
+    rng = random.Random(seed)
+    groups = _group_by_location(y)
     keys = list(groups.keys())
     rng.shuffle(keys)
     target_val = max(1, int(round(val_fraction * len(y))))
@@ -149,6 +172,37 @@ def location_grouped_split(
         val_idx = list(groups[smallest])
         train_idx = [i for k in keys if k != smallest for i in groups[k]]
     return train_idx, val_idx
+
+
+def bootstrap_location_split(
+    y: torch.Tensor, seed: int
+) -> Tuple[List[int], List[int]]:
+    """Location-level bootstrap: sample ``len(unique_locations)`` location
+    keys WITH REPLACEMENT, take all images at the sampled locations as
+    train (with duplicates preserved — a location drawn 3x contributes
+    its images 3x to the gradient), and all images at the *unsampled*
+    locations as the out-of-bag (OOB) validation set.
+
+    With ~48 unique GPS locations on this dataset, ~37% of locations
+    are OOB on average, giving ~15-18 OOB images per round — enough
+    signal to estimate val Haversine without permanently holding any
+    location out of training across rounds.
+    """
+    rng = random.Random(seed)
+    groups = _group_by_location(y)
+    keys = list(groups.keys())
+
+    sampled_keys = [rng.choice(keys) for _ in range(len(keys))]
+    sampled_set = set(sampled_keys)
+
+    train_idx: List[int] = []
+    for key in sampled_keys:
+        train_idx.extend(groups[key])
+    oob_idx: List[int] = []
+    for key in keys:
+        if key not in sampled_set:
+            oob_idx.extend(groups[key])
+    return train_idx, oob_idx
 
 
 # ---------------------------------------------------------------------------
@@ -264,50 +318,56 @@ def _freeze_backbone_partial(model: Model) -> None:
         p.requires_grad = True
 
 
-def train(
-    csv_path: str,
-    output_path: str,
+def _train_one_cycle(
+    *,
+    X_raw: torch.Tensor,
+    y: torch.Tensor,
+    train_idx: List[int],
+    val_idx: List[int],
     epochs: int,
     batch_size: int,
     lr: float,
     weight_decay: float,
-    val_fraction: float,
-    seed: int,
     haversine_loss_weight: float,
-    num_clusters: int = _NUM_CLUSTERS,
-) -> float:
-    _seed_everything(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_clusters: int,
+    seed: int,
+    device: torch.device,
+    log_prefix: str = "",
+) -> Tuple[float, dict]:
+    """Run ``epochs`` of training on the given indices.
 
-    X_raw, y = load_raw(csv_path)
-    if len(X_raw) == 0:
-        raise RuntimeError(f"No samples loaded from {csv_path}")
-
-    train_idx, val_idx = location_grouped_split(y, val_fraction=val_fraction, seed=seed)
-    print(f"data: {len(y)} examples, train={len(train_idx)}, val={len(val_idx)}")
-
+    Returns the best (lowest) val Haversine in meters and the
+    corresponding state_dict (CPU). When ``val_idx`` is empty the
+    "best" state is just the final-epoch state and the returned
+    Haversine is the training Haversine of the last epoch (used as a
+    progress proxy when no validation data is available).
+    """
     centers, train_cluster_labels = fit_cluster_centers(
         y[train_idx], n_clusters=num_clusters, seed=seed
     )
-    val_cluster_labels = assign_clusters(y[val_idx], centers)
-    print(f"K-means: {centers.shape[0]} clusters fit on {len(train_idx)} train coords")
+    print(
+        f"{log_prefix}K-means: {centers.shape[0]} clusters fit on "
+        f"{len(train_idx)} train coords"
+    )
 
     train_ds = Img2GPSDataset(
         X_raw[train_idx], y[train_idx], train_cluster_labels, train=True
     )
-    val_ds = Img2GPSDataset(
-        X_raw[val_idx], y[val_idx], val_cluster_labels, train=False
-    )
-
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    has_val = len(val_idx) > 0
+    if has_val:
+        val_cluster_labels = assign_clusters(y[val_idx], centers)
+        val_ds = Img2GPSDataset(
+            X_raw[val_idx], y[val_idx], val_cluster_labels, train=False
+        )
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    else:
+        val_loader = None
 
     model = Model(weights_path=None, num_clusters=num_clusters).to(device)
     model.set_cluster_centers(centers.tolist())
     _freeze_backbone_partial(model)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"params: trainable={trainable:,} / total={total:,}")
 
     ce_loss = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
@@ -317,8 +377,8 @@ def train(
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    best_val_hav = math.inf
-    best_state = None
+    best_metric = math.inf
+    best_state: dict = {}
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -352,36 +412,187 @@ def train(
         train_ce = total_ce / max(n_seen, 1)
         train_hav = total_hav / max(n_seen, 1)
         train_acc = correct / max(n_seen, 1)
-        val_ce, val_hav, val_acc = _evaluate(model, val_loader, device)
 
-        print(
-            f"epoch {epoch:02d}  lr={optimizer.param_groups[0]['lr']:.2e}  "
-            f"train_ce={train_ce:.4f}  train_acc={train_acc:.3f}  train_hav_m={train_hav:.1f}  "
-            f"val_ce={val_ce:.4f}  val_acc={val_acc:.3f}  val_hav_m={val_hav:.1f}"
+        if has_val:
+            val_ce, val_hav, val_acc = _evaluate(model, val_loader, device)
+            print(
+                f"{log_prefix}epoch {epoch:02d}  "
+                f"lr={optimizer.param_groups[0]['lr']:.2e}  "
+                f"train_ce={train_ce:.4f}  train_acc={train_acc:.3f}  train_hav_m={train_hav:.1f}  "
+                f"val_ce={val_ce:.4f}  val_acc={val_acc:.3f}  val_hav_m={val_hav:.1f}"
+            )
+            metric = val_hav
+        else:
+            print(
+                f"{log_prefix}epoch {epoch:02d}  "
+                f"lr={optimizer.param_groups[0]['lr']:.2e}  "
+                f"train_ce={train_ce:.4f}  train_acc={train_acc:.3f}  train_hav_m={train_hav:.1f}  "
+                f"(no val: training on all data)"
+            )
+            metric = train_hav
+
+        if metric < best_metric:
+            best_metric = metric
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+
+    if not best_state:
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    return best_metric, best_state
+
+
+def train(
+    csv_path: str,
+    output_path: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float,
+    val_fraction: float,
+    seed: int,
+    haversine_loss_weight: float,
+    num_clusters: int = _NUM_CLUSTERS,
+    bootstrap_rounds: int = 0,
+    use_all_data: bool = False,
+) -> float:
+    """Top-level dispatcher across split modes.
+
+    * ``use_all_data=True``      -> one cycle on every example, no val
+    * ``bootstrap_rounds > 0``   -> B cycles, location-level bootstrap,
+                                     OOB validation; saves the model
+                                     trained on the best-OOB-fold round
+    * default                    -> one cycle with location-grouped
+                                     held-out val (current behavior)
+    """
+    if use_all_data and bootstrap_rounds > 0:
+        raise ValueError(
+            "--use-all-data and --bootstrap-rounds are mutually exclusive."
         )
 
-        if val_hav < best_val_hav:
-            best_val_hav = val_hav
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    _seed_everything(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if best_state is None:
-        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    X_raw, y = load_raw(csv_path)
+    if len(X_raw) == 0:
+        raise RuntimeError(f"No samples loaded from {csv_path}")
+
+    common_kwargs = dict(
+        X_raw=X_raw,
+        y=y,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        haversine_loss_weight=haversine_loss_weight,
+        num_clusters=num_clusters,
+        seed=seed,
+        device=device,
+    )
+
+    if use_all_data:
+        train_idx = list(range(len(y)))
+        print(f"data: {len(y)} examples, train={len(train_idx)}, val=0 (use-all-data)")
+        best_train_hav, best_state = _train_one_cycle(
+            train_idx=train_idx, val_idx=[], **common_kwargs
+        )
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        torch.save(best_state, output_path)
+        print(f"final train_haversine_m={best_train_hav:.2f}  saved to {output_path}")
+        # No val available — leaderboard val_haversine_m field is left
+        # at the train Haversine so callers don't have to special-case
+        # the missing field. The companion ``mode`` field disambiguates.
+        print(
+            "RESULT "
+            f"mode=all_data "
+            f"k={num_clusters} lr={lr:g} hav_w={haversine_loss_weight:g} "
+            f"epochs={epochs} batch_size={batch_size} weight_decay={weight_decay:g} "
+            f"seed={seed} bootstrap_rounds=0 "
+            f"val_haversine_m={best_train_hav:.4f} "
+            f"val_haversine_m_mean={best_train_hav:.4f} "
+            f"val_haversine_m_std=0.0000"
+        )
+        return best_train_hav
+
+    if bootstrap_rounds > 0:
+        oob_havs: List[float] = []
+        best_round_hav = math.inf
+        best_round_state: dict = {}
+        best_round_idx = -1
+        for r in range(bootstrap_rounds):
+            round_seed = seed + r
+            train_idx, val_idx = bootstrap_location_split(y, seed=round_seed)
+            if not val_idx:
+                # Extremely unlikely with ~48 unique locations: every key
+                # was sampled at least once. Skip this round to avoid a
+                # zero-OOB metric that would bias the mean downward.
+                print(f"[round {r+1}/{bootstrap_rounds}] empty OOB; skipping")
+                continue
+            print(
+                f"[round {r+1}/{bootstrap_rounds}] data: {len(y)} examples, "
+                f"train={len(train_idx)} (with dupes), oob={len(val_idx)}"
+            )
+            best_hav, state = _train_one_cycle(
+                train_idx=train_idx,
+                val_idx=val_idx,
+                log_prefix=f"[r{r+1}] ",
+                **common_kwargs,
+            )
+            oob_havs.append(best_hav)
+            if best_hav < best_round_hav:
+                best_round_hav = best_hav
+                best_round_state = state
+                best_round_idx = r
+            print(
+                f"[round {r+1}/{bootstrap_rounds}] best_oob_haversine_m={best_hav:.2f}"
+            )
+
+        if not oob_havs:
+            raise RuntimeError("All bootstrap rounds produced empty OOB sets.")
+
+        mean_hav = float(np.mean(oob_havs))
+        std_hav = float(np.std(oob_havs))
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        torch.save(best_round_state, output_path)
+        print(
+            f"bootstrap done: B={len(oob_havs)} rounds, "
+            f"mean_oob_haversine_m={mean_hav:.2f} ± {std_hav:.2f}, "
+            f"best round={best_round_idx + 1} ({best_round_hav:.2f}m) saved to {output_path}"
+        )
+        print(
+            "RESULT "
+            f"mode=bootstrap "
+            f"k={num_clusters} lr={lr:g} hav_w={haversine_loss_weight:g} "
+            f"epochs={epochs} batch_size={batch_size} weight_decay={weight_decay:g} "
+            f"seed={seed} bootstrap_rounds={len(oob_havs)} "
+            f"val_haversine_m={mean_hav:.4f} "
+            f"val_haversine_m_mean={mean_hav:.4f} "
+            f"val_haversine_m_std={std_hav:.4f}"
+        )
+        return mean_hav
+
+    # Default: single location-grouped split.
+    train_idx, val_idx = location_grouped_split(y, val_fraction=val_fraction, seed=seed)
+    print(f"data: {len(y)} examples, train={len(train_idx)}, val={len(val_idx)}")
+    best_val_hav, best_state = _train_one_cycle(
+        train_idx=train_idx, val_idx=val_idx, **common_kwargs
+    )
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     torch.save(best_state, output_path)
     print(f"best val_haversine_m={best_val_hav:.2f}  saved to {output_path}")
-    # Single-line machine-readable summary so notebook sweeps can grep
-    # this out of stdout. Keep field names stable.
     print(
         "RESULT "
-        f"k={num_clusters} "
-        f"lr={lr:g} "
-        f"hav_w={haversine_loss_weight:g} "
-        f"epochs={epochs} "
-        f"batch_size={batch_size} "
-        f"weight_decay={weight_decay:g} "
-        f"seed={seed} "
-        f"val_haversine_m={best_val_hav:.4f}"
+        f"mode=split "
+        f"k={num_clusters} lr={lr:g} hav_w={haversine_loss_weight:g} "
+        f"epochs={epochs} batch_size={batch_size} weight_decay={weight_decay:g} "
+        f"seed={seed} bootstrap_rounds=0 "
+        f"val_haversine_m={best_val_hav:.4f} "
+        f"val_haversine_m_mean={best_val_hav:.4f} "
+        f"val_haversine_m_std=0.0000"
     )
     return best_val_hav
 
@@ -417,6 +628,29 @@ def main() -> None:
             "signal noisier and benefits from a larger Haversine term."
         ),
     )
+    parser.add_argument(
+        "--bootstrap-rounds",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, run B independent training cycles, each with a "
+            "location-level bootstrap sample (locations drawn with "
+            "replacement; OOB locations form the validation set). The "
+            "RESULT line reports mean ± std OOB Haversine across "
+            "rounds. Use this for hyperparameter selection on small "
+            "datasets — every example is validated across rounds, so "
+            "no data is permanently held out."
+        ),
+    )
+    parser.add_argument(
+        "--use-all-data",
+        action="store_true",
+        help=(
+            "Train on every example with no val split (mutually "
+            "exclusive with --bootstrap-rounds). Use for the final "
+            "model after picking the best config via bootstrap."
+        ),
+    )
     args = parser.parse_args()
     train(
         args.csv,
@@ -429,6 +663,8 @@ def main() -> None:
         args.seed,
         args.haversine_loss_weight,
         args.num_clusters,
+        bootstrap_rounds=args.bootstrap_rounds,
+        use_all_data=args.use_all_data,
     )
 
 
