@@ -1,9 +1,13 @@
 """Img2GPS submission model (Project A) -- frozen DINOv2 + soft retrieval head.
 
+The DINOv2 ViT-S/14 implementation is **inlined below** so this file loads as a
+single module on the Hugging Face backend (dynamic ``import model`` with no
+sibling ``dinov2_vit.py`` on ``sys.path``).
+
 Architecture
 ============
 
-    encoder      = DINOv2 ViT-S/14 (vendored, see ``dinov2_vit.py``), frozen
+    encoder      = DINOv2 ViT-S/14 (vendored in this file), frozen
     image -> emb : forward -> CLS token (B, 384) -> L2-normalize
     gallery      : (N_train, 384) L2-normalized training embeddings (buffer)
     gallery_gps  : (N_train, 2)   raw [lat, lon] degrees (buffer)
@@ -13,57 +17,18 @@ Architecture
     weights      = softmax(sim * temperature) # (B, N_train)
     pred         = weights @ gallery_gps      # (B, 2)  raw degrees
 
-Why retrieval (vs the previous ResNet-18 + 2-D regression)
-----------------------------------------------------------
-- 1k photos over a ~64,000 m^2 rectangle gives ~64 m^2 / photo.
-  At test time, every test image lives near a training image; the
-  hard floor on a 1-NN predictor here is sqrt(64)/2 ~= 4 m. A direct
-  regressor cannot beat this on small data because it must share
-  parameters across all photos and ends up averaging.
-- DINOv2 embeddings are state-of-the-art for low-data CV (no
-  fine-tuning needed for this scale of data), and they sit in a
-  cosine-similarity-friendly space.
-- The output is a *convex combination* of training GPS coords with
-  weights coming from softmax, so the model can never predict
-  outside the convex hull of training locations -- which is the
-  correct inductive bias when test photos come from the same
-  rectangle as training.
-
 Spec compliance (Project_submission.pdf section 3.1)
 ----------------------------------------------------
-- ``Model`` and ``IMG2GPS`` classes instantiable with no arguments.   yes
-- ``get_model()`` factory present.                                    yes
-- ``forward(batch)`` returns ``[lat, lon]`` in raw degrees.           yes
-- ``predict(batch)`` accepts a list/tensor of inputs.                 yes
-- Target normalization stats: not used (retrieval has no target
-  standardization), so the "stats must be hard-coded in model.py"
-  clause is vacuously satisfied.
+- ``Model`` / ``IMG2GPS`` with no-arg constructor; ``get_model()``; ``predict``;
+  ``forward`` returns raw degrees. Target normalization N/A for retrieval.
 
-Checkpoint contract
--------------------
-``model.pt`` is a flat ``Model.state_dict()`` saved as::
-
-    {
-        "state_dict": {
-            "encoder.cls_token"             : ...,
-            "encoder.pos_embed"             : ...,
-            "encoder.patch_embed.proj.weight": ...,
-            ...                                    # all DINOv2 ViT-S/14 keys
-            "gallery_emb"                   : (N_train, 384),
-            "gallery_gps"                   : (N_train, 2),
-            "temperature"                   : 0-d tensor,
-        },
-        "version": "dino_retrieval_v1",
-    }
-
-This is the format the staff evaluator (``eval_project_a.py``) expects:
-it filters by exact key + shape match, so we pre-size the gallery
-buffers in ``__init__`` by peeking at the file before the evaluator's
-``_load_checkpoint`` runs.
+Checkpoint: flat ``state_dict`` with ``encoder.*``, ``gallery_emb``, ``gallery_gps``,
+``temperature`` (see staff ``eval_project_a.py``).
 """
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Iterable, Optional
 
@@ -71,31 +36,196 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-try:
-    from .dinov2_vit import DinoVitS14
-except ImportError:
-    from dinov2_vit import DinoVitS14
 
+# ---------------------------------------------------------------------------
+# DINOv2 ViT-S/14 (inlined — must not import a sibling module)
+# ---------------------------------------------------------------------------
+
+
+class _PatchEmbed(nn.Module):
+    def __init__(self, patch_size: int = 14, in_chans: int = 3, embed_dim: int = 384) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+
+class _LayerScale(nn.Module):
+    def __init__(self, dim: int, init_value: float = 1e-5) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(init_value * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma
+
+
+class _Attention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 6, qkv_bias: bool = True) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(out)
+
+
+class _Mlp(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class _Block(nn.Module):
+    def __init__(
+        self,
+        dim: int = 384,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        init_values: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.attn = _Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias)
+        self.ls1 = _LayerScale(dim, init_value=init_values)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.mlp = _Mlp(dim, hidden_dim=int(dim * mlp_ratio))
+        self.ls2 = _LayerScale(dim, init_value=init_values)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.ls1(self.attn(self.norm1(x)))
+        x = x + self.ls2(self.mlp(self.norm2(x)))
+        return x
+
+
+class DinoVitS14(nn.Module):
+    """DINOv2 ViT-S/14; ``state_dict`` keys match the official release."""
+
+    EMBED_DIM = 384
+    PATCH_SIZE = 14
+    DEPTH = 12
+    NUM_HEADS = 6
+    NUM_PATCHES = (224 // 14) ** 2
+    NUM_TOKENS = NUM_PATCHES + 1
+
+    def __init__(self, init_values: float = 1e-5) -> None:
+        super().__init__()
+        self.patch_embed = _PatchEmbed(self.PATCH_SIZE, 3, self.EMBED_DIM)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.EMBED_DIM))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.NUM_TOKENS, self.EMBED_DIM))
+        self.blocks = nn.ModuleList(
+            [
+                _Block(
+                    dim=self.EMBED_DIM,
+                    num_heads=self.NUM_HEADS,
+                    mlp_ratio=4.0,
+                    qkv_bias=True,
+                    init_values=init_values,
+                )
+                for _ in range(self.DEPTH)
+            ]
+        )
+        self.norm = nn.LayerNorm(self.EMBED_DIM, eps=1e-6)
+
+    @torch.no_grad()
+    def _interpolate_pos_encoding(self, num_tokens: int) -> torch.Tensor:
+        if num_tokens == self.NUM_TOKENS:
+            return self.pos_embed
+        cls = self.pos_embed[:, :1]
+        patch = self.pos_embed[:, 1:]
+        old = patch.shape[1]
+        side_old = int(math.isqrt(old))
+        side_new = int(math.isqrt(num_tokens - 1))
+        patch = patch.reshape(1, side_old, side_old, -1).permute(0, 3, 1, 2)
+        patch = F.interpolate(patch, size=(side_new, side_new), mode="bicubic", align_corners=False)
+        patch = patch.permute(0, 2, 3, 1).reshape(1, side_new * side_new, -1)
+        return torch.cat([cls, patch], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)
+        x = self.patch_embed(x)
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self._interpolate_pos_encoding(x.size(1)).to(x.dtype)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        return x[:, 0]
+
+
+_OFFICIAL_DINO_URL = (
+    "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth"
+)
+
+
+def _resize_pos_embed(pos_embed: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    if pos_embed.shape[1] == target_tokens:
+        return pos_embed
+    cls = pos_embed[:, :1]
+    patch = pos_embed[:, 1:]
+    n_old = patch.shape[1]
+    side_old = int(math.isqrt(n_old))
+    side_new = int(math.isqrt(target_tokens - 1))
+    if side_old * side_old != n_old or side_new * side_new != target_tokens - 1:
+        raise ValueError(
+            f"pos_embed sizes must be perfect squares; got {n_old} -> {target_tokens-1}"
+        )
+    patch = patch.reshape(1, side_old, side_old, -1).permute(0, 3, 1, 2)
+    patch = F.interpolate(patch, size=(side_new, side_new), mode="bicubic", align_corners=False)
+    patch = patch.permute(0, 2, 3, 1).reshape(1, side_new * side_new, -1)
+    return torch.cat([cls, patch], dim=1)
+
+
+def load_official_dinov2_vits14(weights_path: str | None = None) -> DinoVitS14:
+    """Load Meta DINOv2 ViT-S/14; ``pos_embed`` resized 518→224 grid."""
+    model = DinoVitS14()
+    if weights_path is None:
+        sd = torch.hub.load_state_dict_from_url(
+            _OFFICIAL_DINO_URL, map_location="cpu", check_hash=False, progress=False
+        )
+    else:
+        sd = torch.load(weights_path, map_location="cpu")
+    sd = {k: v for k, v in sd.items() if k != "mask_token"}
+    if "pos_embed" in sd:
+        sd["pos_embed"] = _resize_pos_embed(sd["pos_embed"], DinoVitS14.NUM_TOKENS)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if unexpected:
+        raise RuntimeError(f"Unexpected DINOv2 keys: {unexpected[:5]}")
+    if missing:
+        raise RuntimeError(f"Missing DINOv2 keys: {missing[:5]}")
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Submission model
+# ---------------------------------------------------------------------------
 
 _DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pt")
 
-
-# Single-spot fallback used when no checkpoint is present so that the
-# model is still constructible and produces in-region predictions.
-# Computed once over the original 89-row metadata.csv (population mean).
 _FALLBACK_GALLERY_GPS = (39.951564082397, -75.19132408239702)
 
 
 class Model(nn.Module):
-    """Frozen DINOv2 ViT-S/14 + soft retrieval over a learned gallery.
-
-    Constructed with no arguments. If ``model.pt`` is present at the
-    canonical path, both the DINOv2 weights and the gallery load from it
-    (ie. no internet needed at inference). If ``model.pt`` is absent,
-    the encoder stays at its (random) init -- predictions are garbage,
-    but the object is still constructible (this matters for the staff
-    evaluator's "instantiate then load checkpoint" flow).
-    """
+    """Frozen DINOv2 ViT-S/14 + soft retrieval over a learned gallery."""
 
     def __init__(self, weights_path: Optional[str] = _DEFAULT_WEIGHTS) -> None:
         super().__init__()
@@ -104,8 +234,6 @@ class Model(nn.Module):
         for p in self.encoder.parameters():
             p.requires_grad_(False)
 
-        # Placeholder buffers (size 1) -- replaced below if a real
-        # checkpoint is reachable.
         gallery_emb = F.normalize(torch.zeros(1, DinoVitS14.EMBED_DIM), dim=-1)
         gallery_emb[0, 0] = 1.0
         gallery_gps = torch.tensor([_FALLBACK_GALLERY_GPS], dtype=torch.float32)
@@ -113,20 +241,9 @@ class Model(nn.Module):
         self.register_buffer("gallery_gps", gallery_gps)
         self.temperature = nn.Parameter(torch.tensor(20.0))
 
-        # The staff evaluator instantiates with ``weights_path="__no_weights__.pth"``
-        # to suppress eager loading, then calls its own ``_load_checkpoint``
-        # which filters by exact shape. So we MUST resize gallery buffers
-        # here before that filter runs. We probe a list of likely paths
-        # (the explicit one first, then canonical fallbacks). If we find a
-        # real file, we fully load from it -- which is also idempotent
-        # with the evaluator's later flat-state-dict load.
         real = self._find_real_weights(weights_path)
         if real is not None:
             self._load_weights(real)
-
-    # ------------------------------------------------------------------
-    # Checkpoint discovery + loading
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _find_real_weights(weights_path: Optional[str]) -> Optional[str]:
@@ -158,9 +275,6 @@ class Model(nn.Module):
         else:
             return
 
-        # Resize gallery buffers from the on-disk shapes BEFORE loading,
-        # so PyTorch's strict=False load (and the staff evaluator's
-        # equivalent filter) treats them as shape-matched.
         emb = sd.get("gallery_emb", None)
         gps = sd.get("gallery_gps", None)
         if isinstance(emb, torch.Tensor) and isinstance(gps, torch.Tensor):
@@ -172,27 +286,19 @@ class Model(nn.Module):
             self.gallery_emb = emb.to(torch.float32)
             self.gallery_gps = gps.to(torch.float32)
 
-        # Strict=False so unrelated keys (e.g. a stray ``version`` string,
-        # or weights from a slightly different architecture) are ignored.
-        # Tensor keys whose names + shapes match get loaded.
         self.load_state_dict(
             {k: v for k, v in sd.items() if isinstance(v, torch.Tensor)},
             strict=False,
         )
 
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
-
     def forward(self, batch) -> torch.Tensor:
         x = self._coerce_batch(batch).float()
-        emb = self.encoder(x)                                   # (B, 384)
+        emb = self.encoder(x)
         emb = F.normalize(emb, dim=-1)
-        sim = emb @ self.gallery_emb.t()                        # (B, N_train)
-        # Clamp temperature so a bad val tune cannot blow up softmax.
+        sim = emb @ self.gallery_emb.t()
         temp = self.temperature.clamp(min=1e-2, max=200.0)
-        weights = torch.softmax(sim * temp, dim=-1)             # (B, N_train)
-        pred = weights @ self.gallery_gps                       # (B, 2)
+        weights = torch.softmax(sim * temp, dim=-1)
+        pred = weights @ self.gallery_gps
         return pred
 
     @torch.no_grad()
@@ -204,14 +310,9 @@ class Model(nn.Module):
 
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Public hook for ``train.py``: returns L2-normalized CLS embeddings."""
         x = self._coerce_batch(x).float()
         emb = self.encoder(x)
         return F.normalize(emb, dim=-1)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _to_tensor(x) -> torch.Tensor:

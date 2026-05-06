@@ -8,11 +8,7 @@ Predict GPS coordinates from a campus image. Metric: **mean Haversine distance (
 Img2GPS/
 ├── README.md
 ├── eval_project_a.py      # course-style local evaluator
-├── dinov2_vit.py          # vendored DINOv2 ViT-S/14 (checkpoint-compatible)
-├── extract_exif.py        # optional: build metadata.csv from camera files
-├── metadata.csv           # image_path, latitude, longitude
-├── model.pt               # frozen DINOv2 + gallery embeddings + GPS + temperature
-├── model.py               # frozen DINOv2 + softmax retrieval head
+├── model.py               # DINOv2 ViT-S/14 (inlined) + softmax retrieval head
 ├── preprocess.py        # 224×224, ImageNet norm, tensor cache
 ├── train.py               # build gallery, Haversine-tune temperature T
 └── reference/             # course sanity-check CSV + images

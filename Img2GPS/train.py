@@ -58,9 +58,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from model import Model
+from model import DinoVitS14, Model, load_official_dinov2_vits14
 from preprocess import IMAGENET_MEAN, IMAGENET_STD, load_raw
-from dinov2_vit import DinoVitS14, load_official_dinov2_vits14
 
 
 def _seed_everything(seed: int = 42) -> None:
