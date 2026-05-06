@@ -203,8 +203,12 @@ def _tune_temperature(
     steps: int = 800,
     lr: float = 1.0,
     log_prefix: str = "",
+    top_k: int = 10,
 ) -> Tuple[float, float]:
     """Fit the softmax temperature by minimizing Haversine on val.
+
+    Softmax is restricted to the ``top_k`` most similar gallery entries
+    per query — same scheme used at inference in ``model.Model.forward``.
 
     Returns (best_T, best_val_haversine_m).
     """
@@ -216,12 +220,15 @@ def _tune_temperature(
     opt = torch.optim.Adam([log_T], lr=lr * 0.05)  # log-space updates: small lr is plenty
 
     sim = val_emb @ train_emb.t()                      # (N_v, N_t), constant
+    k = max(1, min(int(top_k), sim.shape[-1]))
+    topk_sim, topk_idx = sim.topk(k, dim=-1)           # (N_v, K), constant
+    topk_gps = train_gps[topk_idx]                     # (N_v, K, 2), constant
     best_T = float(init_T)
     best_loss = math.inf
     for step in range(steps):
         T = torch.exp(log_T)
-        weights = torch.softmax(sim * T, dim=-1)
-        pred = weights @ train_gps
+        weights = torch.softmax(topk_sim * T, dim=-1)  # (N_v, K)
+        pred = (weights.unsqueeze(-1) * topk_gps).sum(dim=1)
         loss = haversine_meters(pred, val_gps).mean()
         if not torch.isfinite(loss):
             break
@@ -234,7 +241,7 @@ def _tune_temperature(
         opt.step()
         with torch.no_grad():
             log_T.clamp_(min=log_T_min, max=log_T_max)
-    print(f"{log_prefix}temperature tune: T={best_T:.2f}  val_haversine={best_loss:.2f}m")
+    print(f"{log_prefix}temperature tune: T={best_T:.2f}  K={k}  val_haversine={best_loss:.2f}m")
     return best_T, best_loss
 
 
@@ -244,13 +251,17 @@ def _evaluate_with_gallery(
     val_emb: torch.Tensor,
     val_gps: torch.Tensor,
     temperature: float,
+    top_k: int = 10,
 ) -> float:
-    """Run the soft-retrieval prediction and return mean Haversine (m)."""
+    """Run the soft-retrieval prediction (top-K) and return mean Haversine (m)."""
     if val_emb.numel() == 0:
         return float("nan")
     sim = val_emb @ train_emb.t()
-    weights = torch.softmax(sim * float(temperature), dim=-1)
-    pred = weights @ train_gps
+    k = max(1, min(int(top_k), sim.shape[-1]))
+    topk_sim, topk_idx = sim.topk(k, dim=-1)
+    weights = torch.softmax(topk_sim * float(temperature), dim=-1)
+    topk_gps = train_gps[topk_idx]
+    pred = (weights.unsqueeze(-1) * topk_gps).sum(dim=1)
     return float(haversine_meters(pred, val_gps).mean().item())
 
 
@@ -269,6 +280,7 @@ def _build_gallery_and_tune(
     device: torch.device,
     log_prefix: str = "",
     temp_steps: int = 800,
+    top_k: int = 10,
 ) -> Tuple[float, dict]:
     """Returns (val_haversine, payload_for_model_pt).
 
@@ -288,12 +300,13 @@ def _build_gallery_and_tune(
             val_gps,
             steps=temp_steps,
             log_prefix=log_prefix,
+            top_k=top_k,
         )
     else:
         T, val_hav = 20.0, float("nan")
         print(f"{log_prefix}no val: temperature stays at default T={T:.2f}")
 
-    payload = _payload_from_gallery(encoder, train_emb, train_gps, T)
+    payload = _payload_from_gallery(encoder, train_emb, train_gps, T, top_k=top_k)
     return val_hav, payload
 
 
@@ -307,11 +320,13 @@ def _payload_from_gallery(
     gallery_emb: torch.Tensor,
     gallery_gps: torch.Tensor,
     temperature: float,
+    top_k: int = 10,
 ) -> dict:
     flat = {f"encoder.{k}": v for k, v in encoder.state_dict().items()}
     flat["gallery_emb"] = gallery_emb.to(torch.float32)
     flat["gallery_gps"] = gallery_gps.to(torch.float32)
     flat["temperature"] = torch.tensor(float(temperature), dtype=torch.float32)
+    flat["top_k"] = torch.tensor(int(top_k), dtype=torch.int64)
     return {"state_dict": flat, "version": "dino_retrieval_v1"}
 
 
@@ -324,6 +339,7 @@ def train(
     use_all_data: bool = False,
     dinov2_weights: str | None = None,
     temp_steps: int = 800,
+    top_k: int = 10,
 ) -> float:
     if use_all_data and bootstrap_rounds > 0:
         raise ValueError(
@@ -363,6 +379,7 @@ def train(
                 y[tune_va],
                 steps=temp_steps,
                 log_prefix="[all-data T] ",
+                top_k=top_k,
             )
             print(
                 f"data: {len(y)} examples, gallery={len(all_idx)} (all photos); "
@@ -376,7 +393,7 @@ def train(
             )
         full_emb = _embed_all(encoder, X_raw, all_idx, device)
         full_gps = y[all_idx].clone()
-        payload = _payload_from_gallery(encoder, full_emb, full_gps, T)
+        payload = _payload_from_gallery(encoder, full_emb, full_gps, T, top_k=top_k)
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
         torch.save(payload, output_path)
         print(f"saved gallery checkpoint to {output_path}")
@@ -408,6 +425,7 @@ def train(
                 train_idx=train_idx, val_idx=val_idx, device=device,
                 log_prefix=f"[r{r+1}] ",
                 temp_steps=temp_steps,
+                top_k=top_k,
             )
             oob_havs.append(val_hav)
             if val_hav < best_round_hav:
@@ -443,6 +461,7 @@ def train(
         encoder=encoder, X_raw=X_raw, y=y,
         train_idx=train_idx, val_idx=val_idx, device=device,
         temp_steps=temp_steps,
+        top_k=top_k,
     )
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     torch.save(payload, output_path)
@@ -490,6 +509,16 @@ def main() -> None:
         help="Adam steps for Haversine minimization over softmax temperature T.",
     )
     parser.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help=(
+            "Restrict the soft-retrieval softmax to the K most similar gallery "
+            "entries per query (K is saved in the checkpoint and reused at "
+            "inference). Default 10."
+        ),
+    )
+    parser.add_argument(
         "--dinov2-weights",
         default=None,
         help=(
@@ -507,6 +536,7 @@ def main() -> None:
         use_all_data=args.use_all_data,
         dinov2_weights=args.dinov2_weights,
         temp_steps=args.temp_steps,
+        top_k=args.top_k,
     )
 
 

@@ -12,10 +12,13 @@ Architecture
     gallery      : (N_train, 384) L2-normalized training embeddings (buffer)
     gallery_gps  : (N_train, 2)   raw [lat, lon] degrees (buffer)
     temperature  : scalar         softmax sharpness (parameter, learned on val)
+    top_k        : scalar int     restrict softmax to the K most similar
+                                  gallery entries (buffer; default 10)
 
-    sim          = emb @ gallery.T            # (B, N_train)
-    weights      = softmax(sim * temperature) # (B, N_train)
-    pred         = weights @ gallery_gps      # (B, 2)  raw degrees
+    sim                = emb @ gallery.T                       # (B, N_train)
+    topk_sim, topk_idx = sim.topk(K, dim=-1)                   # (B, K)
+    weights            = softmax(topk_sim * temperature)       # (B, K)
+    pred               = sum(weights * gallery_gps[topk_idx])  # (B, 2)
 
 Spec compliance (Project_submission.pdf section 3.1)
 ----------------------------------------------------
@@ -222,6 +225,7 @@ def load_official_dinov2_vits14(weights_path: str | None = None) -> DinoVitS14:
 _DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pt")
 
 _FALLBACK_GALLERY_GPS = (39.951564082397, -75.19132408239702)
+_DEFAULT_TOP_K = 10
 
 
 class Model(nn.Module):
@@ -239,6 +243,7 @@ class Model(nn.Module):
         gallery_gps = torch.tensor([_FALLBACK_GALLERY_GPS], dtype=torch.float32)
         self.register_buffer("gallery_emb", gallery_emb)
         self.register_buffer("gallery_gps", gallery_gps)
+        self.register_buffer("top_k", torch.tensor(_DEFAULT_TOP_K, dtype=torch.int64))
         self.temperature = nn.Parameter(torch.tensor(20.0))
 
         real = self._find_real_weights(weights_path)
@@ -295,10 +300,13 @@ class Model(nn.Module):
         x = self._coerce_batch(batch).float()
         emb = self.encoder(x)
         emb = F.normalize(emb, dim=-1)
-        sim = emb @ self.gallery_emb.t()
+        sim = emb @ self.gallery_emb.t()                                 # (B, N)
         temp = self.temperature.clamp(min=1e-2, max=200.0)
-        weights = torch.softmax(sim * temp, dim=-1)
-        pred = weights @ self.gallery_gps
+        k = max(1, min(int(self.top_k.item()), sim.shape[-1]))
+        topk_sim, topk_idx = sim.topk(k, dim=-1)                         # (B, K)
+        weights = torch.softmax(topk_sim * temp, dim=-1)                 # (B, K)
+        topk_gps = self.gallery_gps[topk_idx]                            # (B, K, 2)
+        pred = (weights.unsqueeze(-1) * topk_gps).sum(dim=1)             # (B, 2)
         return pred
 
     @torch.no_grad()
