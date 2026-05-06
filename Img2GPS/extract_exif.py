@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 import struct
 import subprocess
@@ -157,14 +158,15 @@ def extract_gps(path: str):
     return None, None, None
 
 
-def image_path_for_training(path: str) -> str:
+def image_path_for_training(path: str, *, disambiguator: str | None = None) -> str:
     pl = path.lower()
     if not CONVERT_HEIC_TO_IMAGE or not (pl.endswith(".heic") or pl.endswith(".heif")):
         return path
 
     os.makedirs(CONVERTED_IMAGE_FOLDER, exist_ok=True)
     stem = os.path.splitext(os.path.basename(path))[0]
-    output_path = os.path.join(CONVERTED_IMAGE_FOLDER, f"{stem}.png")
+    target_stem = f"{stem}_{disambiguator}" if disambiguator else stem
+    output_path = os.path.join(CONVERTED_IMAGE_FOLDER, f"{target_stem}.png")
     if os.path.exists(output_path):
         return output_path
 
@@ -212,6 +214,13 @@ def ingest_folder(folder: str, *, append: bool) -> None:
     if not os.path.isdir(folder):
         raise SystemExit(f"Not a directory: {folder}")
 
+    # iPhone IMG_xxxx numbering recurs across shoots, so two ingest folders
+    # often produce HEIC stems that collide with PNGs from earlier waves.
+    # Tag every PNG with a short hash of the source folder's absolute path:
+    # same folder -> same suffix (idempotent re-runs), different folder ->
+    # different suffix (no silent overwrites of unrelated photos).
+    disambiguator = hashlib.sha1(folder.encode("utf-8")).hexdigest()[:8]
+
     eligible = 0
     rows: list[list] = []
     for filename in sorted(os.listdir(folder)):
@@ -224,7 +233,7 @@ def ingest_folder(folder: str, *, append: bool) -> None:
         lat, lon, source = extract_gps(filepath)
         if lat is None:
             continue
-        training_path = image_path_for_training(filepath)
+        training_path = image_path_for_training(filepath, disambiguator=disambiguator)
         rel = _rel_repo(training_path)
         print(f"GPS: {filename} -> {lat:.8f}, {lon:.8f} ({source}) -> {rel}")
         rows.append([rel, lat, lon])
