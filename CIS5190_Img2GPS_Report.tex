@@ -1,0 +1,214 @@
+\documentclass[10pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{mathtools,bbm}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{algorithmicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[colorlinks,linkcolor=blue]{hyperref}
+\usepackage[noabbrev]{cleveref}
+\usepackage{courier}
+\usepackage{enumitem}
+\usepackage[parfill]{parskip}
+\usepackage{multicol}
+\usepackage{listings}
+\usepackage{color}
+\usepackage{xcolor}
+
+
+
+\setlist[itemize]{itemsep=.01cm, topsep=.01cm}
+\setlist[enumerate]{itemsep=.01cm, topsep=.01cm}
+
+
+\oddsidemargin 0in
+\evensidemargin 0in
+\textwidth 6.5in
+\topmargin -0.5in
+\textheight 9.0in
+\setlength{\parskip}{8pt}
+
+\newcommand{\head}[4]{
+\thispagestyle{plain}
+\newpage
+\setcounter{page}{1}
+\noindent
+\begin{center}
+\framebox{ \vbox{ \hbox to 6.28in
+{CIS 4190/5190: Applied Machine Learning \hfill #1}
+\vspace{4mm}
+\hbox to 6.28in
+{\hspace{2.5in}\large\bf\mbox{#2}}
+\vspace{4mm}
+\hbox to 6.28in
+{{\it #3 \hfill #4}}
+}}
+\end{center}
+}
+
+
+
+\begin{document}
+\head{Spring 2026}{Img2GPS: Strong Visual Features Meets Differentiable Retrieval Over a Geo-Tagged Gallery}{Team Members: Sheila Bukenya, Zijing Lin, Jeffrey Oduman}{Project: Img2GPS}
+
+\section{Introduction}
+
+\textbf{Goal.} Project~A (Img2GPS) asks us to infer where a photograph was captured by predicting latitude and longitude in degrees. Compared with generic landmark recognition, campus-scale imagery emphasizes subtle cues\textemdash facade materials, walkways, foliage, viewpoint\textemdash while ground truth can be clustered because many smartphone photos reuse the exact EXIF decimal coordinates recorded at acquisition time.
+
+\textbf{Baseline direction.} The team began with a conventional convolutional baseline: supervised fine-tuning of a pretrained ResNet-style network to regress two continuous outputs (\texttt{latitude}, \texttt{longitude}), trained with squared error\textemdash a standard first-cut that is easy to implement in notebooks and aligns with coursework fluency.
+
+\textbf{Current system.} The submission architecture shifts to representation learning we do \emph{not} fully retrain ourselves. Images are mapped to embeddings with a frozen DINOv2 ViT-S/14 backbone (CLS token), L2-normalized to the unit hypersphere~\cite{oquab2024dinov2}. Predictions arise from differentiable \emph{soft retrieval}: for a query embedding $\mathbf{e}\in\mathbb{R}^{384}$, cosine similarities to each stored gallery embedding induce a softmax over training locations, sharpened by a scalar temperature $T$, and the predicted GPS coordinates are the weighted mixture of gallery GPS targets. Checkpoint construction (\texttt{train.py}) freezes the backbone, materializes embeddings for each training row, holds out locations to avoid leakage, and minimizes mean Haversine distance (meters) on validation to tune~$T$.
+
+\textbf{Why this helps.} DINO-family encoders distill scene semantics from large-scale self-supervised pretraining without extra labels~\cite{oquab2024dinov2}. At prediction time they expose a manifold where visually similar vantage points lie closer together than naive RGB pixels imply. Combining that geometry with retrieval-style aggregation directly optimizes our evaluation metric\textemdash not $\ell_2$ in degree space\textemdash which better matches leaderboard scoring.
+
+\textbf{Highlights.}
+\begin{itemize}
+    \item A reproducible ingestion pipeline parses GPS coordinates from JPEG/PNG and iPhone~\texttt{HEIC} assets (EXIF, Spotlight metadata, Apple extended attributes).
+    \item Preprocessing conforms to Hugging Face backend contracts:~\texttt{prepare\_data} returns ImageNet-normalized $224{\times}224$ tensors and raw~\texttt{y}.
+    \item The student-written model exposes \texttt{get\_model}, \texttt{predict}, forward paths per course spec\textemdash with DINOv2 weights and architecture vendored entirely inside~\texttt{model.py} so the remote importer never fails on sibling modules\textemdash and ships a flat~\texttt{model.pt} gallery plus encoder weights.
+\end{itemize}
+
+\section{Core Components}
+
+This section summarizes how our team tackled the Img2GPS data contract, iterated on modeling ideas, and converged on the evaluation protocol embodied in~\texttt{train.py}.
+
+\begin{itemize}
+
+    \item \textbf{Data collection and dataset.}
+\begin{itemize}[leftmargin=1.25em]
+    \item \emph{Acquisition.} Teammates collected geo-tagged photos around the University of Pennsylvania campus and adjoining areas using consumer phones (\texttt{.jpg},~\texttt{.png},~\texttt{.heic},~\texttt{.heif}).
+    \item \emph{Label extraction.} The script~\texttt{Img2GPS/extract\_exif.py} walks~\texttt{data/images/}, reads embedded GPS tuples, and gracefully falls back to macOS Spotlight (\texttt{mdls}) and Apple~\texttt{xattr}-stored custom locations when Pillow cannot expose EXIF~\mbox{(common for~\texttt{HEIC} clones)}.
+    \item \emph{Conversion.} \texttt{HEIC} thumbnails are routed through~\texttt{qlmanage}-based conversion into~\texttt{data/images\_converted/} so OpenCV preprocessing always sees~\texttt{BGR}$\rightarrow$\texttt{RGB} tensors~\texttt{(3,H,W)} tensors.
+    \item \emph{Curated manifest.} The resulting~\texttt{metadata.csv} aligns with grading aliases (\texttt{image\_path};~\texttt{latitude}/\texttt{longitude} or synonyms). Current repository totals approximately \emph{five hundred seven} labeled photographs spanning roughly \emph{two hundred sixty-two} rounded coordinate pairs\textemdash many photos originate from repeated visits to identical GPS taps, reinforcing the rationale for retrieval rather than insisting each frame carry unique regression targets.
+
+    We maintain grouped train/validation splits keyed by discrete locations rather than IID row sampling (see~\emph{Evaluation and model performance} below) to avoid leakage. The public-facing Hugging Face Dataset link required by~\texttt{May~6,\,2026} should be pasted into the bibliography block or appendix once published.
+
+\end{itemize}
+
+
+    \item \textbf{Model design.}
+\begin{itemize}[leftmargin=1.25em]
+
+    \item \emph{ResNet exploratory baseline.} Early experiments (Sheila \& Zijing) fine-tuned a ResNet backbone to regress normalized coordinates (\texttt{MSE} surrogate). Results were usable for sanity checks\textemdash overfitting hotspots when several photos share precise coordinates signaled that IID metrics could be deceptive\textemdash but error in degree space mismatched leaderboard Haversine, and adapting the head required extra engineering for robust geodesics.
+
+    \item \emph{Architectural pivot (Jeffrey).} The production path replaces regression with:
+    \begin{enumerate}[label=(\alph*),leftmargin=1.75em]
+        \item \textbf{Frozen DINOv2 ViT-S/14 encoder} inlined in~\texttt{model.py} with official pretrained weights (patch size~\texttt{14}, crop~\texttt{224}). Positional encodings interpolate from pretrained resolutions to our square grid.
+        \item \textbf{Gallery buffers }\texttt{gallery\_emb}$\in\mathbb{R}^{N\times384}$ (\texttt{L2$\,$-norm}), \texttt{gallery\_gps}$\in\mathbb{R}^{N\times 2}$.
+        \item \textbf{Soft attention readout.}
+        Given batch embeddings $\mathbf{E}$, similarities $\mathbf{S}=\mathbf{E}\texttt{gallery\_emb}^{\!\top}$, weights $\boldsymbol{\Pi}=\mathrm{softmax}(\mathbf{S}\cdot T)$, prediction $\hat{\mathbf{y}}=\boldsymbol{\Pi}\texttt{gallery\_gps}$ in raw degrees\textemdash exactly the differentiable kNN mixture described in~\texttt{model.py}'s header docstring.
+
+        Temperature~$T$ is the only optimizer-trained scalar during~\texttt{train.py}; gradients flow through softmax into Haversine loss on validation embeddings while encoder weights remain frozen\textemdash a deliberate trade-off respecting limited compute/time and guaranteeing stable features.
+
+    \end{enumerate}
+
+\end{itemize}
+
+
+
+    \item \textbf{Evaluation and model performance.}
+\begin{itemize}[leftmargin=1.25em]
+
+    \item \emph{Official metric:} leaderboard average Haversine great-circle distance~\cite{faa_navigation}
+    \[ d(\mathbf{a},\mathbf{b}) = 2R \arcsin\!\sqrt{
+        \sin^2\frac{\Delta\phi}{2} + \cos\phi_1\cos\phi_2 \sin^2\frac{\Delta\lambda}{2}
+    },\quad R=6{,}371{,}000\text{ m.}
+    \]
+    where $(\phi,\lambda)$ denote latitude/longitude radians~\cite{faa_navigation}.
+
+    \item \emph{Internal protocol:}\ \texttt{train.py}~\texttt{location\_grouped\_split} assigns entire rounded coordinate buckets to train or validation to prevent near-duplicate vantage points leaking across folds. Optionally, bootstrap rounds shuffle location bags for out-of-bag estimates documenting variance.
+
+    \item \emph{Calibration vs.\ gallery size:}\ default mode allocates a proportion (e.g.\ $20$\%) of buckets to validation purely for tuning~$T$;~\texttt{-{}-use-all-data} expands the gallery with every embedding while retaining a stratified calibration split for the scalar temperature\textemdash the configuration we recommend immediately before leaderboard packaging.
+
+    \item \emph{Submission selection:}\ We rely on deterministic scripts (\texttt{python Img2GPS/train.py ...}), cross-check~\texttt{python Img2GPS/eval\_project\_a.py}\ against staff reference~\texttt{.csv}'s subset, inspect printed~\texttt{RESULT} summaries, then upload matching~\texttt{model.py},~\texttt{preprocess.py}, and~\texttt{model.pt}.
+
+\end{itemize}
+
+
+\end{itemize}
+
+\section{Exploratory Components}
+
+We tag several exploratory strands that informed the eventual pipeline.
+
+\textbf{Technique.} Combining vision transformers pretrained with contrasting distillation~\cite{oquab2024dinov2} with geodesically aligned retrieval mirrors ``embed-then-retrieve'' geolocalization ideas: instead of learning a brittle global regressor head on limited localized data, we reuse universal features and amortize specialization through the sparse gallery~\cite{hays2008im2gps}. Differentiable softmax temperature sharpening acts as calibrated kernel bandwidth.
+
+\textbf{Code.} The Hugging Face backend imports a single~\texttt{model.py}; therefore embedding the miniature ViT stack avoids packaging failures~\mbox{(lesson learned from brittle relative imports)}.~\texttt{preprocess.py} caches pickled tensors keyed by~\texttt{mtime}; OpenCV resizing uses area interpolation\textemdash a compromise between fidelity and throughput for thousands of thumbnails.
+
+\textbf{Analysis.} EXIF-derived labels cluster spatially\textemdash the histogram over unique~\texttt{(lat,\,lon)} pairs is skewed\textemdash so naive validation losses can look optimistic unless splits respect physical co-location groups. Embedding-space two-nearest-neighbor probes (qualitative overlays omitted for brevity) showed visibly tighter neighborhoods after DINO embeddings versus early ResNet checkpoints on the same photos.
+
+\textbf{Comparison.} Convolutional regressors regress directly in Cartesian degree space~\mbox{(easier instrumentation)} but penalize outliers poorly relative to Earth's curvature~\mbox{(Boston vs.\ Philly confusion would explode under naive $\ell_2$ loss)} while ignoring duplicate-coordinate structure. Retrieval harmonizes duplicated rows naturally by sharing mass across neighbors. Larger backbones~\mbox{(ViT-L)} or jointly fine-tuned adapters remain future work gated by GPUs.
+
+\textbf{Datasets \& distribution.} The Hugging Face release will mirror~\texttt{metadata.csv} paths with CC-style notes on privacy\textemdash EXIF stripping for external mirrors if required by course ethics guidance.
+
+\textbf{Teaching.}~\texttt{notebooks/Release\_baseline\_model.ipynb} documents reproducible~\texttt{Colab}$\leftrightarrow$\texttt{GitHub} syncing and evaluator smoke tests.
+
+\textbf{Extra application angle.} The same scaffolding could ingest travel albums for approximate trip mapping; caveat: biased sampling toward frequently visited corridors could collapse predictions\textemdash an operational risk we surfaced during debugging.
+
+\textbf{Artifacts not heavily pursued.} Lightweight MobileNet-softmax prototypes mentioned in interim compliance notes preceded the retrieval pivot; archival branches document them if graders require provenance.
+
+
+
+\section{Team Contributions}
+
+\begin{itemize}
+\item \textbf{Sheila Bukenya} collected imagery, helped assemble early metadata, and trained the initial ResNet regression baseline that informed later design decisions.
+
+\item \textbf{Zijing Lin} contributed substantial campus photography\textemdash expanding coverage and viewpoints\textemdash and co-developed the earliest ResNet training experiments jointly with Sheila.
+
+\item \textbf{Jeffrey Oduman} led implementation of the current frozen-DINO retrieval architecture as checked into~\texttt{Img2GPS/model.py} and~\texttt{train.py}, including gallery construction logic, differentiable Haversine temperature calibration, inlined encoder weights plumbing, preprocessing contracts, and local evaluation scripts.
+
+\item \textbf{Reporting:} All three members iterated on drafts of this manuscript; Jeffrey assembled the \LaTeX{} source to match instructor formatting requirements.
+\end{itemize}
+
+\section{Extra Credit}
+
+\textbf{Video demo:}\ \emph{TBD\textemdash insert unlisted URL after recording a $\leq$\,10\,min walkthrough demonstrating data ingestion snippets,~\texttt{train.py} invocation, and live~\texttt{eval\_project\_a.py}. Every teammate must briefly appear for full bonus credit.}
+
+
+
+
+\vspace{3em}
+\noindent
+{\bf Page limit:} The main body of the report should be no more than 5 pages, excluding references. You may include additional text, results, or proofs in the appendix. However, ensure that all important findings are included in the main body, as the project grading team will primarily focus on evaluating the main body of the report.
+
+\section*{(Outside page limit) References}
+\begin{thebibliography}{9}
+\setlength{\itemsep}{2pt plus 1pt}
+
+\bibitem{oquab2024dinov2}
+M.~Oquab \emph{et al.},
+\textit{DINOv2: Learning Robust Visual Features without Supervision.}
+arXiv:2304.07193 (2024).
+\bibitem{faa_navigation}
+Federal Aviation Administration,
+\textit{Great Circle Routes} (conceptual primer on spherical distance computations).
+\\\url{https://www.faa.gov/}.
+
+\bibitem{hays2008im2gps}
+J.~Hays and A.~A. Efros,
+\textit{im2gps: estimating geographic information from a single image.}
+CVPR (2008).
+\end{thebibliography}
+
+\section{(Optional, not included within 5 page limit) Acknowledgments of help received from outside of the project team}
+
+We thank CIS~5190 course staff for releasing reference evaluation harnesses~\texttt{(eval\_project\_a.py)} and documenting backend constraints~\cite{faa_navigation}.
+
+\section{(Optional, not included within 5 page limit) Suggestions for future iterations of this project}
+
+\begin{itemize}[leftmargin=1.25em]
+\item Permit optional auxiliary metadata (\texttt{e.g.,} compass heading)\ with ablation scaffolding.
+\item Release masked mini-test sets emphasizing night vs.\ day generalization\textemdash a failure mode surfaced during informal probing.
+\item Standardize leaderboard reporting of calibrated vs.\ raw gallery metrics to reduce confusion among teams iterating retrieval heads.
+\end{itemize}
+
+\section{(Optional, not included within 5 page limit) Plots and appendix}
+
+\textbf{Potential figures (to generate locally):}(i)~Map scatter of~\texttt{latitude}/\texttt{longitude};~(ii)~train/val Haversine vs.\ epochs of temperature refinement;~(iii)~qualitative retrieval heatmaps~\mbox{(which gallery photos receive largest softmax weights)}.
+
+
+
+\end{document}
