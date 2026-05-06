@@ -53,11 +53,14 @@ def _candidate_image_paths(csv_path: str, image_value: str) -> List[str]:
     repo_root = os.path.abspath(os.path.join(csv_dir, os.pardir))
     cwd = os.getcwd()
     bare = os.path.basename(image_value)
+    # csv-dir-relative candidates win first so an HF-style snapshot with an
+    # `images/` sibling resolves to the HF copy even when a stale local
+    # `data/images_converted/` exists in cwd.
     return [
-        image_value,
-        os.path.join(csv_dir, image_value),
-        os.path.join(csv_dir, bare),
         os.path.join(csv_dir, "images", bare),
+        os.path.join(csv_dir, bare),
+        os.path.join(csv_dir, image_value),
+        image_value,
         os.path.join(cwd, image_value),
         os.path.join(repo_root, image_value),
         os.path.join(repo_root, "data", "images", bare),
