@@ -25,6 +25,16 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Append more photos (e.g. `data/sheila/*.HEIC`)
+
+On **macOS**, HEIC GPS is read via Spotlight (`mdls`) when Pillow cannot; HEIC is converted to `data/images_converted/<stem>.png` with `qlmanage`.
+
+```bash
+python Img2GPS/extract_exif.py --ingest data/sheila
+```
+
+Merges into `Img2GPS/metadata.csv` (dedupes by `image_path`). Use `--ingest-only` to replace the entire CSV with only that folder.
+
 ## Train (submission checkpoint)
 
 ```bash

@@ -1,6 +1,8 @@
+import argparse
 import os
 import struct
 import subprocess
+import sys
 
 import pandas as pd
 from PIL import Image, UnidentifiedImageError
@@ -11,10 +13,17 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir))
 
 IMAGE_FOLDER = os.path.join(_REPO_ROOT, "data", "images")
+SHEILA_FOLDER = os.path.join(_REPO_ROOT, "data", "sheila")
 CONVERTED_IMAGE_FOLDER = os.path.join(_REPO_ROOT, "data", "images_converted")
 OUTPUT_CSV = os.path.join(_THIS_DIR, "metadata.csv")
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".heic")
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".heic", ".heif")
 CONVERT_HEIC_TO_IMAGE = True
+
+
+def _rel_repo(abs_path: str) -> str:
+    """Path relative to repo root with forward slashes (matches metadata.csv)."""
+    rel = os.path.relpath(os.path.abspath(abs_path), _REPO_ROOT)
+    return rel.replace("\\", "/")
 
 
 def _ratio_to_float(value) -> float:
@@ -85,6 +94,44 @@ def get_gps_from_apple_location_xattr(path: str):
     return None, None
 
 
+def get_gps_from_mdls(path: str):
+    """macOS Spotlight: HEIC often has kMDItemLatitude / kMDItemLongitude when
+    Pillow cannot read GPS EXIF (common for iPhone HEIC in git checkouts).
+    """
+    if sys.platform != "darwin":
+        return None, None
+    try:
+        result = subprocess.run(
+            ["mdls", "-name", "kMDItemLatitude", "-name", "kMDItemLongitude", path],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None, None
+
+    lat = lon = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("kMDItemLatitude"):
+            try:
+                lat = float(line.split("=", 1)[1].strip())
+            except (IndexError, ValueError):
+                pass
+        elif line.startswith("kMDItemLongitude"):
+            try:
+                lon = float(line.split("=", 1)[1].strip())
+            except (IndexError, ValueError):
+                pass
+
+    if lat is None or lon is None:
+        return None, None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None, None
+    return lat, lon
+
+
 def extract_gps(path: str):
     try:
         with Image.open(path) as img:
@@ -98,6 +145,10 @@ def extract_gps(path: str):
     else:
         image_error = "no GPS EXIF found"
 
+    lat, lon = get_gps_from_mdls(path)
+    if lat is not None and lon is not None:
+        return lat, lon, "mdls"
+
     lat, lon = get_gps_from_apple_location_xattr(path)
     if lat is not None and lon is not None:
         return lat, lon, "apple_xattr"
@@ -107,7 +158,8 @@ def extract_gps(path: str):
 
 
 def image_path_for_training(path: str) -> str:
-    if not CONVERT_HEIC_TO_IMAGE or not path.lower().endswith(".heic"):
+    pl = path.lower()
+    if not CONVERT_HEIC_TO_IMAGE or not (pl.endswith(".heic") or pl.endswith(".heif")):
         return path
 
     os.makedirs(CONVERTED_IMAGE_FOLDER, exist_ok=True)
@@ -132,7 +184,7 @@ def image_path_for_training(path: str) -> str:
         return path
 
 
-def main() -> None:
+def main_default() -> None:
     data = []
     for filename in sorted(os.listdir(IMAGE_FOLDER)):
         if not filename.lower().endswith(IMAGE_EXTENSIONS):
@@ -143,11 +195,78 @@ def main() -> None:
         if lat is not None and lon is not None:
             training_path = image_path_for_training(filepath)
             print(f"GPS: {filename} -> {lat:.8f}, {lon:.8f} ({source})")
-            data.append([training_path, lat, lon])
+            data.append([_rel_repo(training_path), lat, lon])
 
     df = pd.DataFrame(data, columns=["image_path", "latitude", "longitude"])
     df.to_csv(OUTPUT_CSV, index=False)
     print(f"Done! Extracted {len(df)} GPS locations to {OUTPUT_CSV}.")
+
+
+def ingest_folder(folder: str, *, append: bool) -> None:
+    """Extract GPS from every image in ``folder``, convert HEIC -> PNG under
+    ``data/images_converted``, merge into ``metadata.csv`` when ``append``.
+
+    Prints counts: eligible files, rows with GPS written, skipped (no GPS).
+    """
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder):
+        raise SystemExit(f"Not a directory: {folder}")
+
+    eligible = 0
+    rows: list[list] = []
+    for filename in sorted(os.listdir(folder)):
+        if not filename.lower().endswith(IMAGE_EXTENSIONS):
+            continue
+        filepath = os.path.join(folder, filename)
+        if not os.path.isfile(filepath):
+            continue
+        eligible += 1
+        lat, lon, source = extract_gps(filepath)
+        if lat is None:
+            continue
+        training_path = image_path_for_training(filepath)
+        rel = _rel_repo(training_path)
+        print(f"GPS: {filename} -> {lat:.8f}, {lon:.8f} ({source}) -> {rel}")
+        rows.append([rel, lat, lon])
+
+    no_gps = eligible - len(rows)
+    new_df = pd.DataFrame(rows, columns=["image_path", "latitude", "longitude"])
+
+    if append and os.path.exists(OUTPUT_CSV):
+        old = pd.read_csv(OUTPUT_CSV)
+        out = pd.concat([old, new_df], ignore_index=True)
+        out.drop_duplicates(subset=["image_path"], keep="last", inplace=True)
+        out.sort_values("image_path", kind="mergesort").reset_index(drop=True, inplace=True)
+    else:
+        out = new_df.sort_values("image_path", kind="mergesort").reset_index(drop=True)
+
+    out.to_csv(OUTPUT_CSV, index=False)
+    print(
+        f"\nDone. Folder {folder}: {eligible} image files, "
+        f"{len(rows)} with GPS, {no_gps} skipped (no GPS). "
+        f"metadata.csv now has {len(out)} rows -> {OUTPUT_CSV}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build Img2GPS/metadata.csv from EXIF / Apple xattr GPS.")
+    parser.add_argument(
+        "--ingest",
+        metavar="FOLDER",
+        help=f"Also scan this folder (e.g. {_rel_repo(SHEILA_FOLDER)}). "
+        "Converts HEIC like the default pipeline and merges into metadata.csv.",
+    )
+    parser.add_argument(
+        "--ingest-only",
+        action="store_true",
+        help="With --ingest: only write rows from that folder (replace entire CSV). Default is append/merge.",
+    )
+    args = parser.parse_args()
+
+    if args.ingest:
+        ingest_folder(args.ingest, append=not args.ingest_only)
+        return
+    main_default()
 
 
 if __name__ == "__main__":
